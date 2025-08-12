@@ -4,7 +4,6 @@ This is a Go implementation of the Dione node stress testing script, providing t
 
 ## Features
 
-- **Node Health Check**: Verifies Docker container status and health
 - **Basic RPC Testing**: Tests fundamental RPC methods (chain ID, block number, balance)
 - **Concurrent Request Testing**: Tests multiple simultaneous RPC requests
 - **Mixed Method Testing**: Tests various RPC methods concurrently
@@ -15,8 +14,7 @@ This is a Go implementation of the Dione node stress testing script, providing t
 ## Prerequisites
 
 - Go 1.21 or later
-- Docker (for container management)
-- A running Dione/OdysseyGo node
+- Network access to the RPC endpoint
 
 ## Installation
 
@@ -28,44 +26,62 @@ This is a Go implementation of the Dione node stress testing script, providing t
 go build -o stress-test main.go
 ```
 
-## Prerequisites Setup
+## Configuration
 
-Before running the stress test, you need to set up the Odyssey node manually. Follow these steps:
+The stress test is configured via environment variables. You can either use a remote Odyssey node or run a local one.
 
-### 1. Clone the Odyssey Installer Repository
-
-```bash
-# Clone the installer repository
-git clone https://github.com/DioneProtocol/odysseygo-installer.git
-cd odysseygo-installer/docker
-```
-
-### 2. Set Up and Run Odyssey Node
+### Environment Variables
 
 ```bash
-# Create required directories
-mkdir -p data/.odysseygo data/db logs
+# Set your Odyssey node RPC endpoint
+export ODYSSEY_RPC_URL="http://your-node:9650/ext/bc/D/rpc"
 
-# Create environment configuration
-cat > .env << EOF
-NETWORK=mainnet
-STATE_SYNC=on
-ARCHIVAL_MODE=false
-RPC_ACCESS=public
-EOF
+# Set a test account address for balance checks
+export ODYSSEY_TEST_ACCOUNT="0x1234567890abcdef..."
 
-# Start the node
-docker-compose up -d
+# Optional: Set custom test parameters
+export DURATION=60        # 60 seconds sustained load test
+export ITERATIONS=200     # 200 concurrent requests
+
+# Run the stress test
+./stress-test
 ```
 
-### 3. Wait for Node Sync
+### Running a Local Node
 
-The node needs time to sync:
-- **First run**: Several hours (bootstrap download + sync)
-- **Subsequent runs**: Minutes to hours depending on sync status
-- **Monitor progress**: `docker-compose logs -f`
+To run a local Odyssey node for testing, you can use the official installer repository https://github.com/DioneProtocol/odysseygo-installer.git
 
-**Note**: The first sync may take several hours. Be patient!
+### Required Configuration
+
+The stress test requires these environment variables to be set:
+
+- **ODYSSEY_RPC_URL**: Your Odyssey node RPC endpoint (required)
+- **ODYSSEY_TEST_ACCOUNT**: Test account address for balance checks (required)
+- **DURATION**: Duration of sustained load test in seconds (optional, default: 30)
+- **ITERATIONS**: Number of concurrent requests (optional, default: 100)
+
+### RPC Endpoint Requirements
+
+Your Odyssey node must:
+- Be running and accessible via HTTP/HTTPS
+- Have RPC endpoints enabled
+- Support the following Ethereum-compatible RPC methods:
+  - `eth_chainId`
+  - `eth_blockNumber`
+  - `eth_getBalance`
+
+### Verify Node Connectivity
+
+Before running the stress test, ensure your node is responding:
+
+```bash
+# Test RPC connectivity (should return a block number)
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  $ODYSSEY_RPC_URL
+```
+
+**Important**: Only run the stress test when your node is fully synced and healthy!
 
 ## Usage
 
@@ -75,162 +91,50 @@ The node needs time to sync:
 # Use default values (30s duration, 100 iterations)
 ./stress-test
 
-# Custom duration (60 seconds)
-./stress-test 60
+# Custom duration and iterations via environment variables
+export DURATION=60
+export ITERATIONS=200
+./stress-test
 
-# Custom duration and iterations (60s, 200 iterations)
-./stress-test 60 200
+# Or set them inline
+DURATION=60 ITERATIONS=200 ./stress-test
 
 # Show help
 ./stress-test --help
 ```
 
-### Command Line Parameters
+### Test Selection
 
-- **duration**: Duration of sustained load test in seconds (default: 30)
-- **iterations**: Number of concurrent requests (default: 100)
-
-### Examples
+You can specify which tests to run by providing test names as command line arguments:
 
 ```bash
-# Quick test
+# Run all tests (default behavior)
 ./stress-test
 
-# Extended stress test
-./stress-test 120 500
+# Run only specific tests
+./stress-test basic-rpc
+./stress-test concurrent-block
+./stress-test mixed-methods
+./stress-test sustained-load
 
-# High-load test
-./stress-test 300 1000
+# Run multiple specific tests
+./stress-test basic-rpc concurrent-block
+./stress-test concurrent-chain mixed-methods
+
+# Run all tests explicitly
+./stress-test all
 ```
 
-## Configuration
+#### Available Tests
 
-The stress test uses the following default configuration (defined in `main.go`):
-
-```go
-const (
-    defaultDuration   = 30
-    defaultIterations = 100
-    nodeURL          = "http://localhost:9650/ext/bc/L1m631VHS1yuYkicaNRQTzzbE71dG942sgF3sCnHFgCTzNmsD/rpc"
-    containerName    = "docker-odysseygo-1"
-    testAccount      = "0x8ef8E8E08C4ecE1CCED0Ab36EDA8Af7e1b484e82"
-)
-```
-
-### Customizing Configuration
-
-You can customize the stress test by modifying the constants in `main.go`:
-
-- **`nodeURL`**: Change this if your Odyssey node runs on a different host/port
-- **`containerName`**: Update if you're using a different Docker container name
-- **`testAccount`**: Change to test with a different account address
-
-### Network Configuration
-
-When setting up your Odyssey node, you can configure it via the `.env` file:
-
-```bash
-# Network Configuration
-NETWORK=mainnet          # Use 'testnet' for testnet
-STATE_SYNC=on            # Fast sync for validators
-ARCHIVAL_MODE=false      # Disable for validators (enable for archive nodes)
-RPC_ACCESS=public        # Allow external RPC access
-```
-
-To switch to testnet, edit the `.env` file and change `NETWORK=mainnet` to `NETWORK=testnet`.
-
-### Environment Variables
-
-You can also customize your Odyssey node setup using these environment variables in your `.env` file:
-
-```bash
-# Network and Sync
-NETWORK=mainnet                    # mainnet or testnet
-STATE_SYNC=on                      # on or off (recommended: on for validators)
-ARCHIVAL_MODE=false                # true or false (true for archive nodes)
-
-# RPC Access
-RPC_ACCESS=public                  # public or private
-RPC_HOST_PORT=9650                 # RPC port (default: 9650)
-P2P_HOST_PORT=9651                 # P2P port (default: 9651)
-
-# Performance
-LOG_LEVEL_NODE=info                # Node log level
-LOG_LEVEL_DCHAIN=info              # D-Chain log level
-INDEX_ENABLED=true                 # Enable indexer
-ADMIN_API=false                    # Enable admin API
-ETH_DEBUG_RPC=true                 # Enable debug RPC
-```
-
-To modify these settings, edit the constants in `main.go` and rebuild.
-
-## Setup Process
-
-### 1. Manual Setup (Required)
-
-```bash
-# Clone the installer repository
-cd ..
-git clone https://github.com/DioneProtocol/odysseygo-installer.git
-cd odysseygo-installer/docker
-
-# Create directories
-mkdir -p data/.odysseygo data/db logs
-
-# Create configuration
-cat > .env << EOF
-NETWORK=mainnet
-STATE_SYNC=on
-ARCHIVAL_MODE=false
-RPC_ACCESS=public
-EOF
-
-# Start the node
-docker-compose up -d
-```
-
-### 2. Wait for Sync
-
-The node needs time to sync:
-- **First run**: Several hours (bootstrap download + sync)
-- **Subsequent runs**: Minutes to hours depending on sync status
-- **Monitor progress**: `docker-compose logs -f`
-
-### 3. Verify Node is Ready
-
-Before running the stress test, ensure your node is fully synced and responding:
-
-```bash
-# Check if node is running
-docker ps | grep odysseygo
-
-# Check node logs
-docker-compose logs -f
-
-# Test RPC connectivity (should return a block number)
-curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-  http://localhost:9650/ext/bc/L1m631VHS1yuYkicaNRQTzzbE71dG942sgF3sCnHFgCTzNmsD/rpc
-```
-
-**Important**: Only run the stress test when your node is fully synced and healthy!
-
-## Test Phases
-The stress test runs through several phases:
-
-
-1. **Node Status Check**: Verifies Docker container is running and healthy
-2. **Initial Metrics**: Captures baseline CPU, memory, and network usage
-3. **Basic RPC Test**: Tests fundamental RPC functionality
-4. **Concurrent Requests**: Tests multiple simultaneous requests
-5. **Mixed Methods**: Tests various RPC methods concurrently
-6. **Sustained Load**: Runs continuous requests for specified duration
-7. **Final Metrics**: Captures final resource usage
-8. **Performance Report**: Generates comprehensive test summary
+- **`basic-rpc`**: Tests fundamental RPC methods (chain ID, block number, balance)
+- **`concurrent-block`**: Tests concurrent block number requests
+- **`concurrent-chain`**: Tests concurrent chain ID requests  
+- **`mixed-methods`**: Tests various RPC methods concurrently
+- **`sustained-load`**: Runs continuous requests for specified duration
+- **`all`**: Runs all tests (default when no arguments provided)
 
 ## Output
-
-The stress test provides colorful, emoji-enhanced output similar to the shell script:
 
 - Test initialization and progress
 - Metrics and monitoring
@@ -243,91 +147,19 @@ The stress test provides colorful, emoji-enhanced output similar to the shell sc
 - Error indicators
 - Warning indicators
 
-## Error Handling
-
-The Go version includes comprehensive error handling:
-
-- Graceful degradation when Docker stats are unavailable
-- Detailed error reporting for RPC failures
-- Proper cleanup of resources and goroutines
-- Context cancellation for sustained load tests
-
-## Performance Improvements
-
-Compared to the shell script version:
-
-- **True Concurrency**: Uses Go goroutines instead of background processes
-- **Better Resource Management**: Proper HTTP client reuse and connection pooling
-- **Accurate Timing**: Precise timing measurements using Go's time package
-- **Memory Efficiency**: Streams responses and discards data when not needed
-- **Cross-Platform**: Works on Windows, macOS, and Linux without modification
-
-## Building for Different Platforms
-
-```bash
-# Build for current platform
-go build -o stress-test main.go
-
-# Build for Linux
-GOOS=linux GOARCH=amd64 go build -o stress-test-linux main.go
-
-# Build for Windows
-GOOS=windows GOARCH=amd64 go build -o stress-test.exe main.go
-
-# Build for macOS
-GOOS=darwin GOARCH=amd64 go build -o stress-test-darwin main.go
-```
-
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Docker not running**: Ensure Docker daemon is started
-2. **Container not found**: Verify the container name matches your setup
-3. **RPC connection failed**: Check if the node is accessible at the configured URL
-4. **Permission denied**: Ensure the binary has execute permissions
-5. **Node not syncing**: Check logs with `docker-compose logs -f` and ensure sufficient disk space
-6. **Port conflicts**: Ensure ports 9650 and 9651 are not used by other services
-7. **Bootstrap download fails**: Check internet connection and firewall settings
+1. **RPC connection failed**: Check if the node is accessible at the configured URL
+2. **Permission denied**: Ensure the binary has execute permissions
+3. **Node not responding**: Verify the node is running and synced
+4. **Port conflicts**: Ensure the RPC port is not blocked by firewall
+5. **Network timeout**: Check network connectivity to the RPC endpoint
 
-### Setup-Specific Issues
+### RPC-Specific Issues
 
-1. **Installer repository not found**: Clone it manually with `git clone https://github.com/DioneProtocol/odysseygo-installer.git`
-2. **Node won't start**: Check Docker logs and ensure all required directories exist
-3. **Sync stuck**: The first sync can take hours - be patient and monitor logs
-4. **Wrong network**: Edit the `.env` file to switch between mainnet and testnet
-
-### Debug Mode
-
-To add debug logging, modify the Go code to include more verbose output or add logging statements.
-
-## Comparison with Shell Script
-
-| Feature | Shell Script | Go Version |
-|---------|--------------|------------|
-| Concurrency | Background processes | True goroutines |
-| Error Handling | Basic | Comprehensive |
-| Cross-Platform | Linux/macOS only | All platforms |
-| Performance | Good | Excellent |
-| Resource Usage | Higher | Lower |
-| Maintenance | Shell-specific | Standard Go |
-
-## Contributing
-
-To extend the stress test:
-
-1. Add new test methods to the `StressTest` struct
-2. Implement additional RPC method testing
-3. Add more sophisticated metrics collection
-4. Enhance the reporting system
-
-## License
-
-This project follows the same license as the original shell script.
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section
-2. Verify your Docker and Go setup
-3. Ensure your Dione node is running and accessible
+1. **Invalid RPC URL**: Ensure the URL format is correct (e.g., `http://host:port/ext/bc/D/rpc`)
+2. **Authentication required**: Some nodes require API keys or authentication
+3. **Rate limiting**: The node may have request rate limits
+4. **Method not supported**: Ensure the node supports the required RPC methods

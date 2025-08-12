@@ -9,20 +9,28 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
+	
+	"github.com/joho/godotenv"
 )
 
 // Configuration constants
 const (
 	defaultDuration   = 30
 	defaultIterations = 100
-	nodeURL          = "http://localhost:9650/ext/bc/L1m631VHS1yuYkicaNRQTzzbE71dG942sgF3sCnHFgCTzNmsD/rpc"
-	containerName    = "docker-odysseygo-1"
-	testAccount      = "0x8ef8E8E08C4ecE1CCED0Ab36EDA8Af7e1b484e82"
+	defaultTestAccount = "0x8ef8E8E08C4ecE1CCED0Ab36EDA8Af7e1b484e82"
+)
+
+// Test types constants
+const (
+	TestBasicRPC            = "basic-rpc"
+	TestConcurrentBlockNum  = "concurrent-block"
+	TestConcurrentChainID   = "concurrent-chain"
+	TestMixedMethods        = "mixed-methods"
+	TestSustainedLoad       = "sustained-load"
+	TestAll                 = "all"
 )
 
 // RPC request/response structures
@@ -45,106 +53,152 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
-// Docker stats structure
-type DockerStats struct {
-	CPUPerc string `json:"CPUPerc"`
-	MemUsage string `json:"MemUsage"`
-	NetIO   string `json:"NetIO"`
+// Performance metrics structure
+type PerformanceMetrics struct {
+	StartTime time.Time
+	EndTime   time.Time
+	Duration  time.Duration
+	Requests  int
+	Errors    int
 }
 
 // StressTest holds the test configuration and state
 type StressTest struct {
 	duration   int
 	iterations int
+	nodeURL    string
+	testAccount string
 	client     *http.Client
 	startTime  time.Time
 }
 
+// TestRunner handles test execution
+type TestRunner struct {
+	st    *StressTest
+	tests []string
+}
+
+// NewTestRunner creates a new test runner instance
+func NewTestRunner(st *StressTest, tests []string) *TestRunner {
+	return &TestRunner{
+		st:    st,
+		tests: tests,
+	}
+}
+
+// RunTests executes the specified tests
+func (tr *TestRunner) RunTests() error {
+	// Always check node status first
+	if err := tr.st.checkNodeStatus(); err != nil {
+		return err
+	}
+	
+	// If no tests specified or "all" is specified, run all tests
+	if len(tr.tests) == 0 || contains(tr.tests, TestAll) {
+		tr.runAllTests()
+		return nil
+	}
+	
+	// Run only specified tests
+	for _, test := range tr.tests {
+		switch test {
+		case TestBasicRPC:
+			tr.st.testBasicRPC()
+		case TestConcurrentBlockNum:
+			tr.st.testConcurrentRequests(tr.st.iterations, "eth_blockNumber", "block number requests")
+		case TestConcurrentChainID:
+			tr.st.testConcurrentRequests(tr.st.iterations, "eth_chainId", "chain ID requests")
+		case TestMixedMethods:
+			tr.st.testMixedMethods(tr.st.iterations / 2)
+		case TestSustainedLoad:
+			tr.st.testSustainedLoad()
+		default:
+			fmt.Printf("Unknown test: %s\n", test)
+		}
+	}
+	
+	return nil
+}
+
+// runAllTests runs all available tests
+func (tr *TestRunner) runAllTests() {
+	tr.st.getInitialMetrics()
+	tr.st.testBasicRPC()
+	tr.st.testConcurrentRequests(tr.st.iterations, "eth_blockNumber", "block number requests")
+	tr.st.testConcurrentRequests(tr.st.iterations, "eth_chainId", "chain ID requests")
+	tr.st.testMixedMethods(tr.st.iterations / 2)
+	tr.st.testSustainedLoad()
+	tr.st.getFinalMetrics()
+	tr.st.generateReport()
+}
+
+// contains checks if a slice contains a specific string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 // NewStressTest creates a new stress test instance
-func NewStressTest(duration, iterations int) *StressTest {
+func NewStressTest(duration, iterations int, nodeURL, testAccount string) *StressTest {
 	return &StressTest{
-		duration:   duration,
-		iterations: iterations,
-		client:     &http.Client{Timeout: 30 * time.Second},
+		duration:    duration,
+		iterations:  iterations,
+		nodeURL:     nodeURL,
+		testAccount: testAccount,
+		client:      &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
 // printHeader prints the test header information
 func (st *StressTest) printHeader() {
-	fmt.Println("Dione Node Stress Testing Script")
+	fmt.Println("Odyssey Chain Stress Testing Script")
 	fmt.Println("=====================================")
-	fmt.Printf("Node URL: %s\n", nodeURL)
-	fmt.Printf("Container: %s\n", containerName)
+	fmt.Printf("Node URL: %s\n", st.nodeURL)
+	fmt.Printf("Test Account: %s\n", st.testAccount)
 	fmt.Printf("Test Duration: %ds\n", st.duration)
 	fmt.Printf("Iterations: %d\n", st.iterations)
 	fmt.Println()
 }
 
-// checkNodeStatus verifies if the Docker container is running and healthy
+// checkNodeStatus verifies if the RPC endpoint is accessible and responding
 func (st *StressTest) checkNodeStatus() error {
-	fmt.Println("Checking node status...")
+	fmt.Println("Checking node connectivity...")
 	
-	cmd := exec.Command("docker", "ps", "--filter", "name="+containerName, "--format", "{{.Names}}\t{{.Status}}")
-	output, err := cmd.Output()
+	// Test basic RPC connectivity
+	resp, err := st.makeRPCRequest("eth_chainId")
 	if err != nil {
-		return fmt.Errorf("failed to check docker container: %v", err)
+		return fmt.Errorf("failed to connect to RPC endpoint: %v", err)
 	}
 	
-	if len(output) == 0 {
-		return fmt.Errorf("node container is not running")
-	}
-	
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, containerName) {
-			if strings.Contains(line, "healthy") {
-				fmt.Println("Node is healthy")
-			} else {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					fmt.Printf("Node status: %s\n", parts[1])
-				}
-			}
-			return nil
-		}
-	}
-	
-	return fmt.Errorf("node container not found")
+	fmt.Printf("Node is accessible - Chain ID: %v\n", resp.Result)
+	return nil
 }
 
-// getDockerStats retrieves current Docker container statistics
-func getDockerStats() (*DockerStats, error) {
-	cmd := exec.Command("docker", "stats", containerName, "--no-stream", "--format", "{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get docker stats: %v", err)
+// getPerformanceMetrics returns current performance metrics
+func (st *StressTest) getPerformanceMetrics() *PerformanceMetrics {
+	return &PerformanceMetrics{
+		StartTime: st.startTime,
+		EndTime:   time.Now(),
+		Duration:  time.Since(st.startTime),
+		Requests:  0, // Will be updated during tests
+		Errors:    0, // Will be updated during tests
 	}
-	
-	parts := strings.Fields(strings.TrimSpace(string(output)))
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("unexpected docker stats format")
-	}
-	
-	return &DockerStats{
-		CPUPerc: parts[0],
-		MemUsage: parts[1],
-		NetIO:   parts[2],
-	}, nil
 }
 
-// getInitialMetrics displays initial Docker container metrics
+// getInitialMetrics displays initial performance metrics
 func (st *StressTest) getInitialMetrics() {
-	fmt.Println("Getting initial metrics...")
+	fmt.Println("Getting initial performance metrics...")
 	
-	stats, err := getDockerStats()
-	if err != nil {
-		fmt.Printf("Failed to get initial metrics: %v\n", err)
-		return
-	}
+	// Set start time for metrics
+	st.startTime = time.Now()
 	
-	fmt.Printf("Initial CPU: %s\n", stats.CPUPerc)
-	fmt.Printf("Initial Memory: %s\n", stats.MemUsage)
-	fmt.Printf("Initial Network: %s\n", stats.NetIO)
+	fmt.Printf("Start Time: %s\n", st.startTime.Format("15:04:05"))
+	fmt.Printf("Test Duration: %ds\n", st.duration)
+	fmt.Printf("Test Iterations: %d\n", st.iterations)
 	fmt.Println()
 }
 
@@ -162,7 +216,7 @@ func (st *StressTest) makeRPCRequest(method string, params ...interface{}) (*RPC
 		return nil, err
 	}
 	
-	resp, err := st.client.Post(nodeURL, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := st.client.Post(st.nodeURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +260,7 @@ func (st *StressTest) testBasicRPC() {
 	}
 	
 	// Test balance
-	resp, err = st.makeRPCRequest("eth_getBalance", testAccount, "latest")
+	resp, err = st.makeRPCRequest("eth_getBalance", st.testAccount, "latest")
 	if err != nil {
 		fmt.Printf("Failed to get balance: %v\n", err)
 	} else {
@@ -239,7 +293,7 @@ func (st *StressTest) testConcurrentRequests(count int, method, description stri
 			}
 			
 			jsonData, _ := json.Marshal(req)
-			resp, err := st.client.Post(nodeURL, "application/json", bytes.NewBuffer(jsonData))
+			resp, err := st.client.Post(st.nodeURL, "application/json", bytes.NewBuffer(jsonData))
 			if err != nil {
 				results <- err
 				return
@@ -293,7 +347,7 @@ func (st *StressTest) testMixedMethods(count int) {
 						JSONRPC: "2.0",
 						ID:      1,
 						Method:  m,
-						Params:  []interface{}{testAccount, "latest"},
+						Params:  []interface{}{st.testAccount, "latest"},
 					}
 				} else {
 					req = RPCRequest{
@@ -304,7 +358,7 @@ func (st *StressTest) testMixedMethods(count int) {
 				}
 				
 				jsonData, _ := json.Marshal(req)
-				resp, err := st.client.Post(nodeURL, "application/json", bytes.NewBuffer(jsonData))
+				resp, err := st.client.Post(st.nodeURL, "application/json", bytes.NewBuffer(jsonData))
 				if err != nil {
 					results <- err
 					return
@@ -361,7 +415,7 @@ func (st *StressTest) testSustainedLoad() {
 				}
 				
 				jsonData, _ := json.Marshal(req)
-				resp, err := st.client.Post(nodeURL, "application/json", bytes.NewBuffer(jsonData))
+				resp, err := st.client.Post(st.nodeURL, "application/json", bytes.NewBuffer(jsonData))
 				if err == nil && resp != nil {
 					resp.Body.Close()
 				}
@@ -376,19 +430,16 @@ done:
 	fmt.Println()
 }
 
-// getFinalMetrics displays final Docker container metrics
+// getFinalMetrics displays final performance metrics
 func (st *StressTest) getFinalMetrics() {
-	fmt.Println("Getting final metrics...")
+	fmt.Println("Getting final performance metrics...")
 	
-	stats, err := getDockerStats()
-	if err != nil {
-		fmt.Printf("Failed to get final metrics: %v\n", err)
-		return
-	}
+	metrics := st.getPerformanceMetrics()
 	
-	fmt.Printf("Final CPU: %s\n", stats.CPUPerc)
-	fmt.Printf("Final Memory: %s\n", stats.MemUsage)
-	fmt.Printf("Final Network: %s\n", stats.NetIO)
+	fmt.Printf("Total Duration: %v\n", metrics.Duration)
+	fmt.Printf("Total Requests: %d\n", metrics.Requests)
+	fmt.Printf("Total Errors: %d\n", metrics.Errors)
+	fmt.Printf("Requests per Second: %.2f\n", float64(metrics.Requests)/metrics.Duration.Seconds())
 	fmt.Println()
 }
 
@@ -396,15 +447,6 @@ func (st *StressTest) getFinalMetrics() {
 func (st *StressTest) generateReport() {
 	fmt.Println("Performance Report")
 	fmt.Println("==================")
-	
-	// Check final node health
-	cmd := exec.Command("docker", "ps", "--filter", "name="+containerName, "--format", "{{.Status}}")
-	output, err := cmd.Output()
-	if err == nil && strings.Contains(string(output), "healthy") {
-		fmt.Println("Node Health: HEALTHY")
-	} else {
-		fmt.Println("Node Health: UNHEALTHY")
-	}
 	
 	// Test final RPC response
 	fmt.Println("Final RPC Test...")
@@ -426,50 +468,113 @@ func (st *StressTest) generateReport() {
 
 // checkDependencies verifies required tools are available
 func checkDependencies() error {
-	tools := []string{"docker"}
-	
-	for _, tool := range tools {
-		if _, err := exec.LookPath(tool); err != nil {
-			return fmt.Errorf("%s is not installed", tool)
-		}
-	}
-	
+	// No external dependencies required for RPC-only testing
 	return nil
 }
 
-// showUsage displays command line usage information
-func showUsage() {
-	fmt.Println("Usage: ./stress-test [duration] [iterations]")
-	fmt.Println()
-	fmt.Println("Parameters:")
-	fmt.Printf("  duration    Duration of sustained load test in seconds (default: %d)\n", defaultDuration)
-	fmt.Printf("  iterations  Number of concurrent requests (default: %d)\n", defaultIterations)
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  ./stress-test                    # Use default values")
-	fmt.Println("  ./stress-test 60                # 60 second sustained load test")
-	fmt.Println("  ./stress-test 60 200            # 60 seconds, 200 concurrent requests")
+// loadEnvFile loads environment variables from .env file
+func loadEnvFile() error {
+	// Try to load .env file, but don't fail if it doesn't exist
+	if err := godotenv.Load(); err != nil {
+		// .env file not found is not an error
+		log.Println("No .env file found, using system environment variables")
+	}
+	return nil
 }
 
-// main function
-func main() {
-	// Parse command line arguments
-	var duration, iterations int = defaultDuration, defaultIterations
+// getConfigFromEnv gets configuration from environment variables
+func getConfigFromEnv() (string, string, int, int) {
+	nodeURL := os.Getenv("ODYSSEY_RPC_URL")
+	log.Println("nodeURL", nodeURL)
+	if nodeURL == "" {
+		log.Fatalf("ODYSSEY_RPC_URL environment variable is required")
+	}
 	
-	if len(os.Args) > 1 {
-		if os.Args[1] == "-h" || os.Args[1] == "--help" {
-			showUsage()
-			return
-		}
-		
-		if d, err := strconv.Atoi(os.Args[1]); err == nil {
+	testAccount := os.Getenv("ODYSSEY_TEST_ACCOUNT")
+	if testAccount == "" {
+		testAccount = defaultTestAccount
+	}
+
+	// Get duration from environment variable
+	duration := defaultDuration
+	if envDuration := os.Getenv("DURATION"); envDuration != "" {
+		if d, err := strconv.Atoi(envDuration); err == nil {
 			duration = d
 		}
 	}
 	
-	if len(os.Args) > 2 {
-		if i, err := strconv.Atoi(os.Args[2]); err == nil {
+	// Get iterations from environment variable
+	iterations := defaultIterations
+	if envIterations := os.Getenv("ITERATIONS"); envIterations != "" {
+		if i, err := strconv.Atoi(envIterations); err == nil {
 			iterations = i
+		}
+	}
+	
+	return nodeURL, testAccount, duration, iterations
+}
+
+// parseTestArgs parses command line arguments for test selection
+func parseTestArgs() []string {
+	var tests []string
+	
+	// Skip the first argument (program name)
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		
+		// Skip help flags
+		if arg == "-h" || arg == "--help" {
+			continue
+		}
+		
+		// Add test name
+		tests = append(tests, arg)
+	}
+	
+	return tests
+}
+
+// showUsage displays command line usage information
+func showUsage() {
+	fmt.Println("Usage: ./stress-test [test1] [test2] ...")
+	fmt.Println()
+	fmt.Println("Available Tests:")
+	fmt.Printf("  %s              Basic RPC functionality test\n", TestBasicRPC)
+	fmt.Printf("  %s        Concurrent block number requests\n", TestConcurrentBlockNum)
+	fmt.Printf("  %s         Concurrent chain ID requests\n", TestConcurrentChainID)
+	fmt.Printf("  %s           Mixed RPC methods test\n", TestMixedMethods)
+	fmt.Printf("  %s        Sustained load test\n", TestSustainedLoad)
+	fmt.Printf("  %s                 Run all tests (default)\n", TestAll)
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  ./stress-test                                    # Run all tests")
+	fmt.Println("  ./stress-test basic-rpc                          # Run only basic RPC test")
+	fmt.Println("  ./stress-test concurrent-block mixed-methods     # Run specific tests")
+	fmt.Println("  ./stress-test sustained-load                     # Run only sustained load test")
+	fmt.Println()
+	fmt.Println("Environment Variables:")
+	fmt.Println("  ODYSSEY_RPC_URL      RPC endpoint URL (required)")
+	fmt.Println("  ODYSSEY_TEST_ACCOUNT Test account address (required)")
+	fmt.Println("  DURATION             Duration of sustained load test in seconds (default: 30)")
+	fmt.Println("  ITERATIONS           Number of concurrent requests (default: 100)")
+	fmt.Println()
+	fmt.Println("Environment Examples:")
+	fmt.Println("  ODYSSEY_RPC_URL=http://my-node:9650/ext/bc/D/rpc ODYSSEY_TEST_ACCOUNT=0x1234... DURATION=60 ITERATIONS=200 ./stress-test")
+	fmt.Println("  # Or set them before running:")
+	fmt.Println("  export ODYSSEY_RPC_URL=http://my-node:9650/ext/bc/D/rpc")
+	fmt.Println("  export ODYSSEY_TEST_ACCOUNT=0x1234...")
+	fmt.Println("  export DURATION=60")
+	fmt.Println("  export ITERATIONS=200")
+	fmt.Println("  ./stress-test")
+}
+
+// main function
+func main() {
+	// Check for help flag
+	if len(os.Args) > 1 {
+		if os.Args[1] == "-h" || os.Args[1] == "--help" {
+			showUsage()
+			return
 		}
 	}
 	
@@ -478,25 +583,42 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 	
-	// Create and run stress test
-	st := NewStressTest(duration, iterations)
-	
-	fmt.Println("Starting Dione Node Stress Testing...")
-	fmt.Println()
-	
-	// Run tests
-	if err := st.checkNodeStatus(); err != nil {
-		log.Fatalf("%v", err)
+	// Load environment variables from .env file
+	if err := loadEnvFile(); err != nil {
+		log.Fatalf("Failed to load .env file: %v", err)
 	}
 	
-	st.getInitialMetrics()
-	st.testBasicRPC()
-	st.testConcurrentRequests(iterations, "eth_blockNumber", "block number requests")
-	st.testConcurrentRequests(iterations, "eth_chainId", "chain ID requests")
-	st.testMixedMethods(iterations / 2)
-	st.testSustainedLoad()
-	st.getFinalMetrics()
-	st.generateReport()
+	// Get configuration from environment variables
+	nodeURL, testAccount, duration, iterations := getConfigFromEnv()
+	
+	// Parse test arguments
+	tests := parseTestArgs()
+	
+	// Create and run stress test
+	st := NewStressTest(duration, iterations, nodeURL, testAccount)
+	
+	// Set start time
+	st.startTime = time.Now()
+	
+	fmt.Println("Starting Odyssey Chain Stress Testing...")
+	fmt.Println()
+	
+	// Print header
+	st.printHeader()
+	
+	// Print selected tests
+	if len(tests) == 0 {
+		fmt.Println("Running all tests...")
+	} else {
+		fmt.Printf("Running selected tests: %v\n", tests)
+	}
+	fmt.Println()
+	
+	// Create test runner and execute tests
+	runner := NewTestRunner(st, tests)
+	if err := runner.RunTests(); err != nil {
+		log.Fatalf("%v", err)
+	}
 	
 	fmt.Println("Stress testing completed successfully!")
 }
