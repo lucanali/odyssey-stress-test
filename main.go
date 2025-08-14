@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"sort"
@@ -14,6 +17,7 @@ import (
 	"sync"
 	"time"
 	
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/joho/godotenv"
 )
 
@@ -32,6 +36,7 @@ const (
 	TestConcurrentChainID   = "concurrent-chain"
 	TestMixedMethods        = "mixed-methods"
 	TestSustainedLoad       = "sustained-load"
+	TestTransactionTPS      = "transaction-tps"
 	TestAll                 = "all"
 )
 
@@ -55,6 +60,29 @@ type RPCError struct {
 	Message string `json:"message"`
 }
 
+// Transaction structures
+type Transaction struct {
+	Nonce    string `json:"nonce"`
+	GasPrice string `json:"gasPrice"`
+	Gas      string `json:"gas"`
+	To       string `json:"to"`
+	Value    string `json:"value"`
+	Data     string `json:"data"`
+	ChainID  string `json:"chainId"`
+}
+
+type SignedTransaction struct {
+	RawTransaction string `json:"rawTransaction"`
+}
+
+type TransactionReceipt struct {
+	TransactionHash   string `json:"transactionHash"`
+	BlockNumber       string `json:"blockNumber"`
+	GasUsed           string `json:"gasUsed"`
+	Status            string `json:"status"`
+	EffectiveGasPrice string `json:"effectiveGasPrice"`
+}
+
 // Performance metrics structure
 type PerformanceMetrics struct {
 	StartTime time.Time
@@ -67,6 +95,12 @@ type PerformanceMetrics struct {
 	MinResponseTime   time.Duration
 	MaxResponseTime   time.Duration
 	ResponseTimes     []time.Duration // Store individual response times for percentiles
+	// Transaction-specific metrics
+	TransactionsSent    int
+	TransactionsMined   int
+	TransactionTPS      float64
+	AverageMiningTime   time.Duration
+	MiningTimes         []time.Duration
 }
 
 // ResponseTimeTracker tracks individual request response times
@@ -75,6 +109,11 @@ type ResponseTimeTracker struct {
 	requestTimes  []time.Time      // When each request was made
 	responseTimes []time.Duration  // Response time for each request
 	startTime     time.Time
+	// Transaction tracking
+	transactionStartTimes map[string]time.Time // Track when each transaction was sent
+	transactionMiningTimes []time.Duration     // Track mining times
+	transactionsSent      int
+	transactionsMined     int
 }
 
 // NewResponseTimeTracker creates a new response time tracker
@@ -83,6 +122,8 @@ func NewResponseTimeTracker() *ResponseTimeTracker {
 		requestTimes:  make([]time.Time, 0),
 		responseTimes: make([]time.Duration, 0),
 		startTime:     time.Now(),
+		transactionStartTimes: make(map[string]time.Time),
+		transactionMiningTimes: make([]time.Duration, 0),
 	}
 }
 
@@ -158,6 +199,62 @@ func (rt *ResponseTimeTracker) GetCurrentTPS() float64 {
 	return 0
 }
 
+// RecordTransactionSent records when a transaction is sent
+func (rt *ResponseTimeTracker) RecordTransactionSent(txHash string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.transactionStartTimes[txHash] = time.Now()
+	rt.transactionsSent++
+}
+
+// RecordTransactionMined records when a transaction is mined
+func (rt *ResponseTimeTracker) RecordTransactionMined(txHash string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	if startTime, exists := rt.transactionStartTimes[txHash]; exists {
+		miningTime := time.Since(startTime)
+		rt.transactionMiningTimes = append(rt.transactionMiningTimes, miningTime)
+		rt.transactionsMined++
+		delete(rt.transactionStartTimes, txHash) // Clean up
+	}
+}
+
+// GetTransactionStats returns transaction statistics
+func (rt *ResponseTimeTracker) GetTransactionStats() (sent, mined int, avgMiningTime time.Duration, miningTPS float64) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	
+	sent = rt.transactionsSent
+	mined = rt.transactionsMined
+	
+	if len(rt.transactionMiningTimes) == 0 {
+		return sent, mined, 0, 0
+	}
+	
+	// Calculate average mining time
+	var total time.Duration
+	for _, t := range rt.transactionMiningTimes {
+		total += t
+	}
+	avgMiningTime = total / time.Duration(len(rt.transactionMiningTimes))
+	
+	// Calculate mining TPS (transactions mined per second)
+	if len(rt.transactionMiningTimes) > 0 {
+		// Use a 10-second window for recent mining TPS
+		recentMined := len(rt.transactionMiningTimes)
+		if recentMined > 10 {
+			recentMined = 10 // Only consider last 10 transactions for TPS
+		}
+		
+		if recentMined > 0 {
+			miningTPS = float64(recentMined) / 10.0
+		}
+	}
+	
+	return sent, mined, avgMiningTime, miningTPS
+}
+
 // StressTest holds the test configuration and state
 type StressTest struct {
 	duration   int
@@ -170,6 +267,10 @@ type StressTest struct {
 	responseTracker *ResponseTimeTracker
 	// Add request rate control
 	requestRate int // requests per second (0 = auto-calculate from iterations/duration)
+	// Add private key for transaction signing
+	privateKey *ecdsa.PrivateKey
+	// Add chain ID for transaction signing
+	chainID *big.Int
 }
 
 // TestRunner handles test execution
@@ -212,6 +313,8 @@ func (tr *TestRunner) RunTests() error {
 			tr.st.testMixedMethods(tr.st.iterations / 2)
 		case TestSustainedLoad:
 			tr.st.testSustainedLoad()
+		case TestTransactionTPS:
+			tr.st.testTransactionTPS()
 		default:
 			fmt.Printf("Unknown test: %s\n", test)
 		}
@@ -228,6 +331,7 @@ func (tr *TestRunner) runAllTests() {
 	tr.st.testConcurrentRequests(tr.st.iterations, "eth_chainId", "chain ID requests")
 	tr.st.testMixedMethods(tr.st.iterations / 2)
 	tr.st.testSustainedLoad()
+	tr.st.testTransactionTPS()
 	tr.st.getFinalMetrics()
 	tr.st.generateReport()
 }
@@ -243,7 +347,7 @@ func contains(slice []string, item string) bool {
 }
 
 // NewStressTest creates a new stress test instance
-func NewStressTest(duration, iterations int, nodeURL, testAccount string, requestRate int) *StressTest {
+func NewStressTest(duration, iterations int, nodeURL, testAccount string, requestRate int, privateKey *ecdsa.PrivateKey, chainID *big.Int) *StressTest {
 	return &StressTest{
 		duration:    duration,
 		iterations:  iterations,
@@ -252,7 +356,44 @@ func NewStressTest(duration, iterations int, nodeURL, testAccount string, reques
 		client:      &http.Client{Timeout: 30 * time.Second},
 		responseTracker: NewResponseTimeTracker(),
 		requestRate:     requestRate,
+		privateKey:      privateKey,
+		chainID:         chainID,
 	}
+}
+
+// loadPrivateKey loads private key from environment variable
+func loadPrivateKey() *ecdsa.PrivateKey {
+	privateKeyHex := os.Getenv("PRIVATE_KEY")
+	if privateKeyHex == "" {
+		return nil
+	}
+	
+	// Remove "0x" prefix if present
+	if len(privateKeyHex) >= 2 && privateKeyHex[:2] == "0x" {
+		privateKeyHex = privateKeyHex[2:]
+	}
+	
+	// Validate hex format
+	if len(privateKeyHex) != 64 { // 32 bytes = 64 hex chars
+		log.Printf("Warning: Private key should be 64 hex characters (32 bytes)")
+		return nil
+	}
+	
+	// Decode hex to bytes
+	privateKeyBytes, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		log.Printf("Warning: Invalid private key format: %v", err)
+		return nil
+	}
+	
+	// Parse ECDSA private key
+	privateKey, err := crypto.ToECDSA(privateKeyBytes)
+	if err != nil {
+		log.Printf("Warning: Failed to parse private key: %v", err)
+		return nil
+	}
+	
+	return privateKey
 }
 
 // printHeader prints the test header information
@@ -593,6 +734,13 @@ done:
 	fmt.Println()
 }
 
+// testTransactionTPS tests actual blockchain transaction throughput
+func (st *StressTest) testTransactionTPS() {
+	// Create and run transaction TPS test using the new module
+	tpsTester := NewTransactionTPS(st.nodeURL, st.privateKey, st.iterations, st.responseTracker)
+	tpsTester.RunTransactionTPSTest()
+}
+
 // getFinalMetrics displays final performance metrics
 func (st *StressTest) getFinalMetrics() {
 	fmt.Println("Getting final performance metrics...")
@@ -618,6 +766,17 @@ func (st *StressTest) getFinalMetrics() {
 		// Show current TPS
 		currentTPS := st.responseTracker.GetCurrentTPS()
 		fmt.Printf("  Current TPS: %.2f\n", currentTPS)
+		
+		// Show transaction statistics if available
+		sent, mined, avgMiningTime, miningTPS := st.responseTracker.GetTransactionStats()
+		if sent > 0 {
+			fmt.Println("\nTransaction Statistics:")
+			fmt.Printf("  Transactions Sent: %d\n", sent)
+			fmt.Printf("  Transactions Mined: %d\n", mined)
+			fmt.Printf("  Mining TPS: %.2f\n", miningTPS)
+			fmt.Printf("  Average Mining Time: %v\n", avgMiningTime)
+			fmt.Printf("  Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
+		}
 	}
 	
 	fmt.Println()
@@ -744,6 +903,7 @@ func showUsage() {
 	fmt.Printf("  %s         Concurrent chain ID requests\n", TestConcurrentChainID)
 	fmt.Printf("  %s           Mixed RPC methods test\n", TestMixedMethods)
 	fmt.Printf("  %s        Sustained load test\n", TestSustainedLoad)
+	fmt.Printf("  %s         Blockchain transaction TPS test\n", TestTransactionTPS)
 	fmt.Printf("  %s                 Run all tests (default)\n", TestAll)
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -751,6 +911,7 @@ func showUsage() {
 	fmt.Println("  ./stress-test basic-rpc                          # Run only basic RPC test")
 	fmt.Println("  ./stress-test concurrent-block mixed-methods     # Run specific tests")
 	fmt.Println("  ./stress-test sustained-load                     # Run only sustained load test")
+	fmt.Println("  ./stress-test transaction-tps                    # Run only transaction TPS test")
 	fmt.Println()
 	fmt.Println("Environment Variables:")
 	fmt.Println("  ODYSSEY_RPC_URL      RPC endpoint URL (required)")
@@ -758,6 +919,8 @@ func showUsage() {
 	fmt.Println("  DURATION             Duration of sustained load test in seconds (default: 30)")
 	fmt.Println("  ITERATIONS           Number of concurrent requests (default: 100)")
 	fmt.Println("  REQUEST_RATE         Requests per second for sustained load (default: auto-calculate)")
+	fmt.Println("  PRIVATE_KEY          Private key for transaction signing (hex format, optional)")
+	fmt.Println("  GAS_PRICE            Custom gas price in wei (optional, defaults to network price + 20%)")
 	fmt.Println()
 	fmt.Println("Environment Examples:")
 	fmt.Println("  ODYSSEY_RPC_URL=http://my-node:9650/ext/bc/D/rpc ODYSSEY_TEST_ACCOUNT=0x1234... DURATION=60 ITERATIONS=200 ./stress-test")
@@ -767,6 +930,8 @@ func showUsage() {
 	fmt.Println("  export DURATION=60")
 	fmt.Println("  export ITERATIONS=200")
 	fmt.Println("  export REQUEST_RATE=50  # Force 50 requests per second")
+	fmt.Println("  export PRIVATE_KEY=0x1234...  # For transaction TPS testing")
+	fmt.Println("  export GAS_PRICE=250000000000  # Custom gas price (250 Gwei)")
 	fmt.Println("  ./stress-test")
 }
 
@@ -793,11 +958,14 @@ func main() {
 	// Get configuration from environment variables
 	nodeURL, testAccount, duration, iterations, requestRate := getConfigFromEnv()
 	
+	// Load private key from environment variable
+	privateKey := loadPrivateKey()
+	
 	// Parse test arguments
 	tests := parseTestArgs()
 	
 	// Create and run stress test
-	st := NewStressTest(duration, iterations, nodeURL, testAccount, requestRate)
+	st := NewStressTest(duration, iterations, nodeURL, testAccount, requestRate, privateKey, nil) // chainID will be set during transaction test
 	
 	// Set start time
 	st.startTime = time.Now()
@@ -823,4 +991,50 @@ func main() {
 	}
 	
 	fmt.Println("Stress testing completed successfully!")
+}
+
+// getGasPrice gets the current gas price from the network
+func (st *StressTest) getGasPrice() (*big.Int, error) {
+	// Check if custom gas price is set
+	if customGasPrice := os.Getenv("GAS_PRICE"); customGasPrice != "" {
+		gasPrice, ok := new(big.Int).SetString(customGasPrice, 10)
+		if ok {
+			fmt.Printf("Using custom gas price: %s wei\n", gasPrice.String())
+			return gasPrice, nil
+		}
+		fmt.Printf("Warning: Invalid custom gas price '%s', falling back to network price\n", customGasPrice)
+	}
+	
+	resp, err := st.makeRPCRequest("eth_gasPrice")
+	if err != nil {
+		return nil, err
+	}
+	
+	gasPriceHex, ok := resp.Result.(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid gas price response")
+	}
+	
+	// Remove "0x" prefix and decode
+	if len(gasPriceHex) < 2 || gasPriceHex[:2] != "0x" {
+		return nil, fmt.Errorf("invalid hex format: %s", gasPriceHex)
+	}
+	
+	hexStr := gasPriceHex[2:] // Remove "0x" prefix
+	if len(hexStr)%2 != 0 {
+		hexStr = "0" + hexStr // Pad with leading zero if odd length
+	}
+	
+	gasPriceBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode hex gas price: %v", err)
+	}
+	
+	gasPrice := new(big.Int).SetBytes(gasPriceBytes)
+	
+	// Add 20% buffer to ensure transaction goes through
+	buffer := new(big.Int).Mul(gasPrice, big.NewInt(120))
+	buffer = buffer.Div(buffer, big.NewInt(100))
+	
+	return buffer, nil
 }
