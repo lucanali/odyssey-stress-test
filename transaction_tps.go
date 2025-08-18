@@ -166,13 +166,6 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 				fmt.Printf("    Block Finalization: Avg %v per block\n", avgFinalizationTime)
 			}
 			
-			// Write to file
-			if file != nil {
-				if avgFinalizationTime > 0 {
-					fmt.Fprintf(file, "    Block Finalization: Avg %v per block\n", avgFinalizationTime)
-				}
-			}
-			
 			// Check if all transactions are mined
 			if mined >= sent {
 				fmt.Println("\n ALL TRANSACTIONS MINED! Test completed successfully!")
