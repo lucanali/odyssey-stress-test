@@ -25,6 +25,9 @@ type TransactionTPS struct {
 	privateKey     *ecdsa.PrivateKey
 	iterations     int
 	responseTracker *ResponseTimeTracker
+	outputFilePath string
+	fileWriteMu    sync.Mutex
+	finalizedLogged map[string]bool
 }
 
 // NewTransactionTPS creates a new TransactionTPS instance
@@ -135,6 +138,9 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 		fmt.Printf("Warning: Could not create output file: %v\n", err)
 	} else {
 		defer file.Close()
+		// store for incremental appends
+		t.outputFilePath = outputFile
+		if t.finalizedLogged == nil { t.finalizedLogged = make(map[string]bool) }
 		fmt.Fprintf(file, "Odyssey Chain Transaction TPS Test Results\n")
 		fmt.Fprintf(file, "==========================================\n")
 		fmt.Fprintf(file, "Test Date: %s\n", time.Now().Format("2006-01-02 15:04:05"))
@@ -143,9 +149,10 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 		fmt.Fprintf(file, "Total Transactions: %d\n", sentCount)
 		fmt.Fprintf(file, "Start Time: %s\n", startTime.Format("15:04:05"))
 		fmt.Fprintf(file, "Send Duration: %v\n", sendDuration)
-		fmt.Fprintf(file, "Send TPS: %.2f\n", float64(sentCount)/sendDuration.Seconds())
 		fmt.Fprintf(file, "\nMining Progress:\n")
 		fmt.Fprintf(file, "================\n")
+		fmt.Fprintf(file, "\nFinalized Transactions (appended as they complete):\n")
+		fmt.Fprintf(file, "===============================================\n")
 	}
 	
 	// Monitor until all transactions are mined
@@ -200,6 +207,8 @@ done:
 		fmt.Printf("Waiting... %d transactions still pending\n", pendingCount)
 		time.Sleep(100 * time.Millisecond)
 	}
+	// final sweep to append any finalized-but-unlogged txs
+	t.logAllFinalizedNotLogged()
 	
 	if time.Since(startWait) >= timeout {
 		fmt.Printf("Timeout reached after %v - some transactions may still be pending\n", timeout)
@@ -215,7 +224,6 @@ done:
 	fmt.Printf("Total Mined: %d\n", mined)
 	fmt.Printf("Send Duration: %v\n", sendDuration)
 	fmt.Printf("Total Duration: %v\n", totalDuration)
-	fmt.Printf("Send TPS: %.2f\n", float64(sent)/sendDuration.Seconds())
 	fmt.Printf("Final Mining TPS: %.4f\n", finalTPS)
 	fmt.Printf("Average Mining Time: %v\n", detailedAvgMiningTime)
 	fmt.Printf("Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
@@ -325,7 +333,6 @@ done:
 		fmt.Fprintf(file, "Total Mined: %d\n", mined)
 		fmt.Fprintf(file, "Send Duration: %v\n", sendDuration)
 		fmt.Fprintf(file, "Total Duration: %v\n", totalDuration)
-		fmt.Fprintf(file, "Send TPS: %.2f\n", float64(sent)/sendDuration.Seconds())
 		fmt.Fprintf(file, "Final Mining TPS: %.4f\n", finalTPS)
 		fmt.Fprintf(file, "Average Mining Time: %v\n", detailedAvgMiningTime)
 		fmt.Fprintf(file, "Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
@@ -869,7 +876,9 @@ func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash 
 		
 		// Record finalization time for this transaction and all others in the same block
 		t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+		t.logFinalizedTx(txHash)
 		t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
+		t.logFinalizedTxsInBlock(blockNumber)
 		return
 	}
 	
@@ -890,6 +899,7 @@ func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash 
 					finalizationTime = time.Since(startTime)
 				}
 				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+				t.logFinalizedTx(txHash)
 				return 
 			}
 			
@@ -902,7 +912,9 @@ func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash 
 				fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
 				
 				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+				t.logFinalizedTx(txHash)
 				t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
+				t.logFinalizedTxsInBlock(blockNumber)
 				return
 			}
 			
@@ -919,6 +931,7 @@ func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash 
 					fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, newBlockNumber, finalizationTime)
 					
 					t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+					t.logFinalizedTx(txHash)
 					return
 				}
 			}
@@ -933,6 +946,7 @@ func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash 
 		finalizationTime = time.Since(startTime)
 	}
 	t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+	t.logFinalizedTx(txHash)
 }
 
 // monitorRealTransactionFinalization monitors a transaction for finalization
@@ -953,7 +967,9 @@ func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, block
 		
 		// Record finalization time for this transaction and all others in the same block
 		t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+		t.logFinalizedTx(txHash)
 		t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
+		t.logFinalizedTxsInBlock(blockNumber)
 		return
 	}
 	
@@ -970,6 +986,7 @@ func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, block
 			if time.Since(startTime) > maxWaitTime { 
 				// Mark as finalized even if timeout (block is likely accepted)
 				t.responseTracker.RecordTransactionFinalized(txHash, time.Since(startTime))
+				t.logFinalizedTx(txHash)
 				return 
 			}
 			
@@ -979,7 +996,9 @@ func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, block
 				fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
 				
 				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+				t.logFinalizedTx(txHash)
 				t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
+				t.logFinalizedTxsInBlock(blockNumber)
 				return
 			}
 			
@@ -996,6 +1015,7 @@ func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, block
 					fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, newBlockNumber, finalizationTime)
 					
 					t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
+					t.logFinalizedTx(txHash)
 					return
 				}
 			}
@@ -1006,6 +1026,85 @@ func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, block
 
 	// fallback finalization - mark as finalized if we've been monitoring this long
 	t.responseTracker.RecordTransactionFinalized(txHash, time.Since(startTime))
+	t.logFinalizedTx(txHash)
+}
+
+// logFinalizedTx appends a single finalized transaction entry to the results file (once)
+func (t *TransactionTPS) logFinalizedTx(txHash string) {
+	if t.outputFilePath == "" { return }
+
+	// prevent duplicate entries
+	t.fileWriteMu.Lock()
+	if t.finalizedLogged == nil { t.finalizedLogged = make(map[string]bool) }
+	if t.finalizedLogged[txHash] { t.fileWriteMu.Unlock(); return }
+	t.fileWriteMu.Unlock()
+
+	// fetch timing info for this tx
+	ind := t.responseTracker.GetIndividualTransactionTimings()
+	timing, exists := ind[txHash]
+
+	// open file for append
+	f, err := os.OpenFile(t.outputFilePath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil { return }
+	defer f.Close()
+
+	// prepare fields
+	shortHash := txHash
+	if len(txHash) > 20 { shortHash = txHash[:10] + "..." + txHash[len(txHash)-10:] }
+	var blockStr string
+	if exists {
+		if bn, ok := timing["blockNumber"].(string); ok { blockStr = bn }
+	}
+	var finTimeStr string
+	if exists {
+		if ft, ok := timing["finalizationTime"].(time.Duration); ok { finTimeStr = ft.String() }
+	}
+	var miningTimeStr string
+	if exists {
+		if mt, ok := timing["miningTime"].(time.Duration); ok { miningTimeStr = mt.String() }
+	}
+
+	// write entry
+	if blockStr != "" || finTimeStr != "" || miningTimeStr != "" {
+		fmt.Fprintf(f, "Finalized: %s", shortHash)
+		if blockStr != "" { fmt.Fprintf(f, " | Block: %s", blockStr) }
+		if miningTimeStr != "" { fmt.Fprintf(f, " | Mining: %s", miningTimeStr) }
+		if finTimeStr != "" { fmt.Fprintf(f, " | Finality: %s", finTimeStr) }
+		fmt.Fprintln(f)
+	} else {
+		fmt.Fprintf(f, "Finalized: %s\n", shortHash)
+	}
+
+	// mark as logged
+	t.fileWriteMu.Lock()
+	t.finalizedLogged[txHash] = true
+	t.fileWriteMu.Unlock()
+}
+
+// logFinalizedTxsInBlock appends all finalized txs in a block (skipping ones already logged)
+func (t *TransactionTPS) logFinalizedTxsInBlock(blockNumber string) {
+	ind := t.responseTracker.GetIndividualTransactionTimings()
+	for txHash, timing := range ind {
+		bn, ok := timing["blockNumber"].(string)
+		if !ok || bn != blockNumber { continue }
+		if finalized, ok := timing["finalized"].(bool); ok && finalized {
+			t.logFinalizedTx(txHash)
+		}
+	}
+}
+
+// logAllFinalizedNotLogged appends any finalized txs that haven't been logged yet
+func (t *TransactionTPS) logAllFinalizedNotLogged() {
+	ind := t.responseTracker.GetIndividualTransactionTimings()
+	for txHash, timing := range ind {
+		if finalized, ok := timing["finalized"].(bool); ok && finalized {
+			// check logged flag
+			t.fileWriteMu.Lock()
+			already := t.finalizedLogged != nil && t.finalizedLogged[txHash]
+			t.fileWriteMu.Unlock()
+			if !already { t.logFinalizedTx(txHash) }
+		}
+	}
 }
 
 // checkTransactionRemining checks if a transaction was re-mined in a different block
