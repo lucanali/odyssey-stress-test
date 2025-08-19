@@ -249,13 +249,40 @@ func (rt *ResponseTimeTracker) RecordTransactionMined(txHash string) {
 	}
 }
 
+// GetTransactionStartTime returns the start time for a specific transaction
+func (rt *ResponseTimeTracker) GetTransactionStartTime(txHash string) time.Time {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	
+	if startTime, exists := rt.transactionStartTimes[txHash]; exists {
+		return startTime
+	}
+	return time.Time{}
+}
+
 // RecordTransactionMinedInBlock records when a transaction is mined with block information
 func (rt *ResponseTimeTracker) RecordTransactionMinedInBlock(txHash string, blockNumber string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	
 	if startTime, exists := rt.transactionStartTimes[txHash]; exists {
+		// Calculate mining time from start to now (this will be overridden with accurate time)
 		miningTime := time.Since(startTime)
+		rt.transactionMiningTimes = append(rt.transactionMiningTimes, miningTime)
+		rt.transactionMiningTimeByHash[txHash] = miningTime
+		rt.transactionBlocks[txHash] = blockNumber
+		rt.transactionMiningEndTimes[txHash] = time.Now() // Record when mining completed
+		rt.transactionsMined++
+		delete(rt.transactionStartTimes, txHash) // Clean up
+	}
+}
+
+// RecordTransactionMinedInBlockWithTime records when a transaction is mined with accurate mining time
+func (rt *ResponseTimeTracker) RecordTransactionMinedInBlockWithTime(txHash string, blockNumber string, miningTime time.Duration) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	if _, exists := rt.transactionStartTimes[txHash]; exists {
 		rt.transactionMiningTimes = append(rt.transactionMiningTimes, miningTime)
 		rt.transactionMiningTimeByHash[txHash] = miningTime
 		rt.transactionBlocks[txHash] = blockNumber
@@ -295,6 +322,20 @@ func (rt *ResponseTimeTracker) RecordTransactionFinalized(txHash string, finaliz
 	if _, exists := rt.transactionBlocks[txHash]; exists {
 		// Transaction was mined, now it's finalized
 		fmt.Printf("Debug: Transaction %s finalized after %v\n", txHash, finalizationTime)
+	}
+}
+
+// FinalizeAllTransactionsInBlock marks all transactions in a specific block as finalized
+func (rt *ResponseTimeTracker) FinalizeAllTransactionsInBlock(blockNumber string, finalizationTime time.Duration) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	
+	// Find all transactions in this block and mark them as finalized
+	for txHash, blockNum := range rt.transactionBlocks {
+		if blockNum == blockNumber {
+			rt.blockFinalizationTimes[txHash] = finalizationTime
+			rt.transactionFinalizationEndTimes[txHash] = time.Now()
+		}
 	}
 }
 
@@ -370,15 +411,6 @@ func (rt *ResponseTimeTracker) GetDetailedTransactionStats() (sent, mined int, a
 			totalMiningTime += t
 		}
 		avgMiningTime = totalMiningTime / time.Duration(len(rt.transactionMiningTimes))
-	}
-	
-	// Calculate average finalization time
-	if len(rt.blockFinalizationTimes) > 0 {
-		var totalFinalizationTime time.Duration
-		for _, t := range rt.blockFinalizationTimes {
-			totalFinalizationTime += t
-		}
-		avgFinalizationTime = totalFinalizationTime / time.Duration(len(rt.blockFinalizationTimes))
 	}
 	
 	// Calculate mining TPS
@@ -918,7 +950,6 @@ func (st *StressTest) testSustainedLoad() {
 		case <-ctx.Done():
 			goto done
 		case <-tpsTicker.C:
-			// Show real-time TPS every 5 seconds
 			currentTPS := st.responseTracker.GetCurrentTPS()
 			fmt.Printf("[%s] Current TPS: %.2f, Total Requests: %d\n", 
 				time.Now().Format("15:04:05"), currentTPS, requestCount)
