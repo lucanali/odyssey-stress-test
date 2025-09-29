@@ -6,36 +6,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"math/big"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	
+
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // TransactionTPS handles transaction throughput testing
 type TransactionTPS struct {
-	nodeURL        string
-	privateKey     *ecdsa.PrivateKey
-	iterations     int
+	nodeURL         string
+	privateKey      *ecdsa.PrivateKey
+	iterations      int
 	responseTracker *ResponseTimeTracker
-	outputFilePath string
-	fileWriteMu    sync.Mutex
+	outputFilePath  string
+	fileWriteMu     sync.Mutex
 	finalizedLogged map[string]bool
 }
 
 // NewTransactionTPS creates a new TransactionTPS instance
 func NewTransactionTPS(nodeURL string, privateKey *ecdsa.PrivateKey, iterations int, responseTracker *ResponseTimeTracker) *TransactionTPS {
 	return &TransactionTPS{
-		nodeURL:        nodeURL,
-		privateKey:     privateKey,
-		iterations:     iterations,
+		nodeURL:         nodeURL,
+		privateKey:      privateKey,
+		iterations:      iterations,
 		responseTracker: responseTracker,
 	}
 }
@@ -43,15 +43,15 @@ func NewTransactionTPS(nodeURL string, privateKey *ecdsa.PrivateKey, iterations 
 // RunTransactionTPSTest runs the transaction TPS test
 func (t *TransactionTPS) RunTransactionTPSTest() {
 	fmt.Println("Testing blockchain transaction TPS...")
-	
+
 	if t.privateKey == nil {
 		fmt.Println("Warning: No private key configured, skipping transaction TPS test")
 		fmt.Println("Set PRIVATE_KEY environment variable to enable transaction testing")
 		return
 	}
-	
+
 	fmt.Printf("Sending %d transactions concurrently to measure throughput...\n", t.iterations)
-	
+
 	// Get current nonce from network
 	nonce, err := t.getCurrentNonce()
 	if err != nil {
@@ -59,26 +59,23 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 		return
 	}
 	fmt.Printf("Starting with nonce: %d\n", nonce)
-	
+
 	// Record start time
 	startTime := time.Now()
-	
+
 	// Send ALL transactions immediately and concurrently
 	fmt.Printf("Sending %d transactions concurrently...\n", t.iterations)
-	
+
 	// Use a channel to coordinate goroutines
 	txChan := make(chan string, t.iterations)
 	var wg sync.WaitGroup
-	
+
 	// Send all transactions at once
 	for i := 0; i < t.iterations; i++ {
 		wg.Add(1)
 		go func(txNonce uint64) {
 			defer wg.Done()
-			
-			// Track sending start time
-			sendStartTime := time.Now()
-			
+
 			// Create and send transaction
 			txHash, err := t.sendRealTransaction(txNonce)
 			if err != nil {
@@ -90,47 +87,44 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 				}
 				return
 			}
-			
-			// Calculate actual sending time
-			sendTime := time.Since(sendStartTime)
-			
-			// Record transaction sent with sending time
-			t.responseTracker.RecordTransactionSentWithTime(txHash, sendTime)
-			
-			fmt.Printf("Transaction %d sent: %s (send time: %v)\n", txNonce, txHash, sendTime)
-			
+
+			// Record transaction sent
+			t.responseTracker.RecordTransactionSent(txHash)
+
+			fmt.Printf("Transaction %d sent: %s\n", txNonce, txHash)
+
 			// Send transaction hash to channel
 			txChan <- txHash
-			
+
 			// Start monitoring immediately after sending
-			go t.monitorRealTransaction(txHash)
-			
+			go t.monitorTransactionInclusion(txHash)
+
 		}(nonce + uint64(i))
 	}
-	
+
 	// Wait for all transactions to be sent
 	wg.Wait()
 	close(txChan)
-	
+
 	// Count sent transactions
 	sentCount := 0
 	for range txChan {
 		sentCount++
 	}
-	
+
 	sendDuration := time.Since(startTime)
 	fmt.Printf("All %d transactions sent in %v (%.2f TPS)\n", sentCount, sendDuration, float64(sentCount)/sendDuration.Seconds())
-	
+
 	// If no transactions were sent successfully, exit early
 	if sentCount == 0 {
 		fmt.Println("No transactions were sent successfully. Exiting test.")
 		return
 	}
-	
-	// Monitor mining progress until ALL transactions are mined
-	fmt.Println("Monitoring transaction mining until ALL transactions are mined...")
+
+	// Monitor until all transactions are included in blocks
+	fmt.Println("Monitoring transaction inclusion until ALL transactions are in blocks...")
 	fmt.Println("This may take several minutes depending on network conditions...")
-	
+
 	// Create output file for detailed results
 	outputFile := fmt.Sprintf("transaction_tps_results_%s.txt", time.Now().Format("20060102_150405"))
 	file, err := os.Create(outputFile)
@@ -140,7 +134,9 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 		defer file.Close()
 		// store for incremental appends
 		t.outputFilePath = outputFile
-		if t.finalizedLogged == nil { t.finalizedLogged = make(map[string]bool) }
+		if t.finalizedLogged == nil {
+			t.finalizedLogged = make(map[string]bool)
+		}
 		fmt.Fprintf(file, "Odyssey Chain Transaction TPS Test Results\n")
 		fmt.Fprintf(file, "==========================================\n")
 		fmt.Fprintf(file, "Test Date: %s\n", time.Now().Format("2006-01-02 15:04:05"))
@@ -149,143 +145,68 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 		fmt.Fprintf(file, "Total Transactions: %d\n", sentCount)
 		fmt.Fprintf(file, "Start Time: %s\n", startTime.Format("15:04:05"))
 		fmt.Fprintf(file, "Send Duration: %v\n", sendDuration)
-		fmt.Fprintf(file, "\nMining Progress:\n")
-		fmt.Fprintf(file, "================\n")
+		fmt.Fprintf(file, "\nBlock Inclusion Progress:\n")
+		fmt.Fprintf(file, "==========================\n")
 		fmt.Fprintf(file, "\nFinalized Transactions (appended as they complete):\n")
 		fmt.Fprintf(file, "===============================================\n")
 	}
-	
-	// Monitor until all transactions are mined
+
+	// Monitor until all transactions are included in blocks
 	monitorTicker := time.NewTicker(1 * time.Millisecond)
 	defer monitorTicker.Stop()
-	startMiningTime := time.Time{}
-	
+
 	for {
 		select {
 		case <-monitorTicker.C:
 			sent, mined, _, _ := t.responseTracker.GetTransactionStats()
-			
-			// Record when first transaction was mined
-			if mined > 0 && startMiningTime.IsZero() {
-				startMiningTime = time.Now()
-			}
-			
-			// Check if all transactions are mined
+
+			// Check if all transactions are included in blocks
 			if mined >= sent {
-				fmt.Println("\n ALL TRANSACTIONS MINED! Test completed successfully!")
+				fmt.Println("\n ALL TRANSACTIONS INCLUDED IN BLOCKS! Test completed successfully!")
 				goto done
 			}
 		}
 	}
-	
+
 done:
 	// Final statistics
 	sent, mined, _, _ := t.responseTracker.GetTransactionStats()
-	
-	// Get detailed statistics
-	_, _, avgSendTime, detailedAvgMiningTime, _, _ := t.responseTracker.GetDetailedTransactionStats()
-	
-	// Wait for any pending transactions to finalize (with timeout)
-	fmt.Println("Waiting for pending transactions to finalize...")
-	timeout := 30 * time.Second
-	startWait := time.Now()
-	
-	for time.Since(startWait) < timeout {
-		finalizationStatus := t.responseTracker.GetTransactionFinalizationStatus()
-		pendingCount := 0
-		for _, finalized := range finalizationStatus {
-			if !finalized {
-				pendingCount++
-			}
-		}
-		
-		if pendingCount == 0 {
-			fmt.Println("All transactions finalized!")
-			break
-		}
-		
-		fmt.Printf("Waiting... %d transactions still pending\n", pendingCount)
-		time.Sleep(100 * time.Millisecond)
-	}
-	// final sweep to append any finalized-but-unlogged txs
-	t.logAllFinalizedNotLogged()
-	
-	if time.Since(startWait) >= timeout {
-		fmt.Printf("Timeout reached after %v - some transactions may still be pending\n", timeout)
-	}
-	
+
 	// Calculate final TPS
 	totalDuration := time.Since(startTime)
 	finalTPS := float64(mined) / totalDuration.Seconds()
-	
+
 	fmt.Printf("\nFinal Transaction TPS Test Results:\n")
 	fmt.Printf("=====================================\n")
 	fmt.Printf("Total Sent: %d\n", sent)
-	fmt.Printf("Total Mined: %d\n", mined)
+	fmt.Printf("Total Included in Blocks: %d\n", mined)
 	fmt.Printf("Send Duration: %v\n", sendDuration)
 	fmt.Printf("Total Duration: %v\n", totalDuration)
-	fmt.Printf("Final Mining TPS: %.4f\n", finalTPS)
-	fmt.Printf("Average Mining Time: %v\n", detailedAvgMiningTime)
+	fmt.Printf("Final TPS: %.4f\n", finalTPS)
 	fmt.Printf("Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
-	
-	// Display detailed timing breakdown
-	fmt.Printf("\nDetailed Timing Breakdown:\n")
-	fmt.Printf("=============================\n")
-	fmt.Printf("Average Sending Time: %v\n", avgSendTime)
-	fmt.Printf("Average Mining Time: %v\n", detailedAvgMiningTime)
-	
+
 	// Show individual transaction breakdowns
 	fmt.Printf("\nIndividual Transaction Breakdown:\n")
 	fmt.Printf("==================================\n")
 	individualTimings := t.responseTracker.GetIndividualTransactionTimings()
-	finalizationStatus := t.responseTracker.GetTransactionFinalizationStatus()
-	
+
 	txIndex := 1
 	for txHash, timing := range individualTimings {
 		fmt.Printf("Transaction %d (%s...%s):\n", txIndex, txHash[:10], txHash[len(txHash)-10:])
-		
-		if sendTime, exists := timing["sendTime"]; exists {
-			fmt.Printf("  Send Time: %v\n", sendTime)
-		}
-		
-		if miningTime, exists := timing["miningTime"]; exists {
-			fmt.Printf("  Mining Time: %v\n", miningTime)
-		}
-		
-		if finalizationTime, exists := timing["finalizationTime"]; exists {
-			fmt.Printf("  Finalization Time: %v\n", finalizationTime)
-		}
-		
+
 		if blockNumber, exists := timing["blockNumber"]; exists {
 			fmt.Printf("  Block: %s\n", blockNumber)
 		}
-		
-		// Show finalization status
-		if finalized, exists := finalizationStatus[txHash]; exists {
-			status := "Pending"
-			if finalized {
-				status = "Finalized"
-			}
-			fmt.Printf("  Status: %s\n", status)
-		} else {
-			fmt.Printf("  Status: Unknown\n")
+
+		if finalizationTime, exists := timing["finalizationTime"]; exists {
+			fmt.Printf("  Block Timestamp: %v\n", finalizationTime)
 		}
-		
+
 		fmt.Println()
 		txIndex++
 	}
-	
-	// Show summary
-	finalizedCount := 0
-	for _, finalized := range finalizationStatus {
-		if finalized {
-			finalizedCount++
-		}
-	}
-	fmt.Printf("Finalization Summary: %d/%d transactions finalized (%.1f%%)\n", finalizedCount, sent, float64(finalizedCount)/float64(sent)*100)
 
 	// Block inclusion summary (how many txs landed per block)
-	// Build counts per normalized block number
 	normalizeBlock := func(block string) string {
 		if strings.HasPrefix(block, "x") || strings.HasPrefix(block, "X") {
 			return "0x" + block[1:]
@@ -305,16 +226,24 @@ done:
 	}
 
 	// Sort blocks by numeric height
-	type blockEntry struct { block string; num uint64; count int }
+	type blockEntry struct {
+		block string
+		num   uint64
+		count int
+	}
 	var blocks []blockEntry
 	for b, c := range blockCounts {
 		bn := b
 		if strings.HasPrefix(bn, "0x") || strings.HasPrefix(bn, "0X") {
 			bn = bn[2:]
 		}
-		if len(bn)%2 != 0 { bn = "0" + bn }
+		if len(bn)%2 != 0 {
+			bn = "0" + bn
+		}
 		num, err := strconv.ParseUint(bn, 16, 64)
-		if err != nil { num = ^uint64(0) }
+		if err != nil {
+			num = ^uint64(0)
+		}
 		blocks = append(blocks, blockEntry{block: b, num: num, count: c})
 	}
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].num < blocks[j].num })
@@ -324,61 +253,34 @@ done:
 	for _, be := range blocks {
 		fmt.Printf("Block %s: %d tx\n", be.block, be.count)
 	}
-	
+
 	// Write final results to file
 	if file != nil {
 		fmt.Fprintf(file, "\nFinal Results:\n")
 		fmt.Fprintf(file, "================\n")
 		fmt.Fprintf(file, "Total Sent: %d\n", sent)
-		fmt.Fprintf(file, "Total Mined: %d\n", mined)
+		fmt.Fprintf(file, "Total Included in Blocks: %d\n", mined)
 		fmt.Fprintf(file, "Send Duration: %v\n", sendDuration)
 		fmt.Fprintf(file, "Total Duration: %v\n", totalDuration)
-		fmt.Fprintf(file, "Final Mining TPS: %.4f\n", finalTPS)
-		fmt.Fprintf(file, "Average Mining Time: %v\n", detailedAvgMiningTime)
+		fmt.Fprintf(file, "Final TPS: %.4f\n", finalTPS)
 		fmt.Fprintf(file, "Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
-		
-		// Write detailed timing breakdown to file
-		fmt.Fprintf(file, "\nDetailed Timing Breakdown:\n")
-		fmt.Fprintf(file, "=============================\n")
-		fmt.Fprintf(file, "Average Sending Time: %v\n", avgSendTime)
-		fmt.Fprintf(file, "Average Mining Time: %v\n", detailedAvgMiningTime)
-		
+
 		// Individual breakdown
 		fmt.Fprintf(file, "\nIndividual Transaction Breakdown:\n")
 		fmt.Fprintf(file, "==================================\n")
 		ind := t.responseTracker.GetIndividualTransactionTimings()
-		finalizationStatus := t.responseTracker.GetTransactionFinalizationStatus()
 		txIndex := 1
 		for txHash, timing := range ind {
 			fmt.Fprintf(file, "Transaction %d (%s...%s):\n", txIndex, txHash[:10], txHash[len(txHash)-10:])
-			if sendTime, ok := timing["sendTime"]; ok { fmt.Fprintf(file, "  Send Time: %v\n", sendTime) }
-			if miningTime, ok := timing["miningTime"]; ok { fmt.Fprintf(file, "  Mining Time: %v\n", miningTime) }
-			if finalizationTime, ok := timing["finalizationTime"]; ok { fmt.Fprintf(file, "  Finalization Time: %v\n", finalizationTime) }
-			if blockNumber, ok := timing["blockNumber"]; ok { fmt.Fprintf(file, "  Block: %s\n", blockNumber) }
-			
-			// Show finalization status
-			if finalized, exists := finalizationStatus[txHash]; exists {
-				status := "Pending"
-				if finalized {
-					status = "Finalized"
-				}
-				fmt.Fprintf(file, "  Status: %s\n", status)
-			} else {
-				fmt.Fprintf(file, "  Status: Unknown\n")
+			if blockNumber, ok := timing["blockNumber"]; ok {
+				fmt.Fprintf(file, "  Block: %s\n", blockNumber)
 			}
-			
+			if finalizationTime, ok := timing["finalizationTime"]; ok {
+				fmt.Fprintf(file, "  Block Timestamp: %v\n", finalizationTime)
+			}
 			fmt.Fprintln(file)
 			txIndex++
 		}
-		
-		// Show summary
-		finalizedCount := 0
-		for _, finalized := range finalizationStatus {
-			if finalized {
-				finalizedCount++
-			}
-		}
-		fmt.Fprintf(file, "Finalization Summary: %d/%d transactions finalized (%.1f%%)\n", finalizedCount, sent, float64(finalizedCount)/float64(sent)*100)
 
 		// Block inclusion summary (file)
 		normalizeBlock := func(block string) string {
@@ -399,14 +301,24 @@ done:
 			}
 		}
 
-		type blockEntry struct { block string; num uint64; count int }
+		type blockEntry struct {
+			block string
+			num   uint64
+			count int
+		}
 		var blocks []blockEntry
 		for b, c := range blockCounts {
 			bn := b
-			if strings.HasPrefix(bn, "0x") || strings.HasPrefix(bn, "0X") { bn = bn[2:] }
-			if len(bn)%2 != 0 { bn = "0" + bn }
+			if strings.HasPrefix(bn, "0x") || strings.HasPrefix(bn, "0X") {
+				bn = bn[2:]
+			}
+			if len(bn)%2 != 0 {
+				bn = "0" + bn
+			}
 			num, err := strconv.ParseUint(bn, 16, 64)
-			if err != nil { num = ^uint64(0) }
+			if err != nil {
+				num = ^uint64(0)
+			}
 			blocks = append(blocks, blockEntry{block: b, num: num, count: c})
 		}
 		sort.Slice(blocks, func(i, j int) bool { return blocks[i].num < blocks[j].num })
@@ -416,10 +328,10 @@ done:
 		for _, be := range blocks {
 			fmt.Fprintf(file, "Block %s: %d tx\n", be.block, be.count)
 		}
-		
+
 		fmt.Printf("\n Detailed results saved to: %s\n", outputFile)
 	}
-	
+
 	fmt.Println()
 }
 
@@ -431,23 +343,23 @@ func (t *TransactionTPS) getCurrentNonce() (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("failed to get public key")
 	}
-	
+
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	
+
 	// Get current nonce from network
 	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["%s","latest"],"id":1}`, fromAddress.Hex())
-	
+
 	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
 	if err != nil {
 		return 0, fmt.Errorf("HTTP error: %v", err)
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read response: %v", err)
 	}
-	
+
 	// Parse the response manually
 	var result struct {
 		JSONRPC string `json:"jsonrpc"`
@@ -458,15 +370,15 @@ func (t *TransactionTPS) getCurrentNonce() (uint64, error) {
 			Message string `json:"message"`
 		} `json:"error,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal(body, &result); err != nil {
 		return 0, fmt.Errorf("failed to parse JSON: %v", err)
 	}
-	
+
 	if result.Error != nil {
 		return 0, fmt.Errorf("RPC error: %s", result.Error.Message)
 	}
-	
+
 	// Parse hex nonce
 	if strings.HasPrefix(result.Result, "0x") {
 		hexStr := result.Result[2:] // Remove "0x" prefix
@@ -480,7 +392,7 @@ func (t *TransactionTPS) getCurrentNonce() (uint64, error) {
 		}
 		return nonce, nil
 	}
-	
+
 	return 0, fmt.Errorf("invalid hex string: %s", result.Result)
 }
 
@@ -492,55 +404,58 @@ func (t *TransactionTPS) sendRealTransaction(nonce uint64) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("failed to get public key")
 	}
-	
+
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	
+
 	// Get gas price
 	gasPrice, err := t.getGasPrice()
 	if err != nil {
 		return "", fmt.Errorf("failed to get gas price: %v", err)
 	}
-	
+
 	// Create transaction (0 ETH to self)
 	tx := types.NewTransaction(
-		nonce,                    // nonce
-		fromAddress,              // to (self)
-		big.NewInt(0),           // value (0 ETH)
-		21000,                   // gas limit
-		gasPrice,                 // gas price
-		nil,                      // data
+		nonce,         // nonce
+		fromAddress,   // to (self)
+		big.NewInt(0), // value (0 ETH)
+		21000,         // gas limit
+		gasPrice,      // gas price
+		nil,           // data
 	)
-	
+
 	// Sign transaction with hardcoded chain ID (131313 for local testnet)
-	chainID := big.NewInt(131313)
-	signer := types.NewEIP155Signer(chainID)
+	// chainID, err := t.getChainID()
+	// if err != nil {
+	// 	return "", fmt.Errorf("failed to get chain ID: %v", err)
+	// }
+	signer := types.NewEIP155Signer(big.NewInt(43112))
 	signedTx, err := types.SignTx(tx, signer, t.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %v", err)
 	}
-	
+
 	// Encode to hex
 	encodedTx, err := signedTx.MarshalBinary()
 	if err != nil {
 		return "", fmt.Errorf("failed to encode transaction: %v", err)
 	}
-	
+
 	txHex := "0x" + hex.EncodeToString(encodedTx)
-	
+
 	// Send transaction
 	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["%s"],"id":1}`, txHex)
-	
+
 	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("HTTP error: %v", err)
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %v", err)
 	}
-	
+
 	// Parse the response manually
 	var result struct {
 		JSONRPC string `json:"jsonrpc"`
@@ -551,16 +466,67 @@ func (t *TransactionTPS) sendRealTransaction(nonce uint64) (string, error) {
 			Message string `json:"message"`
 		} `json:"error,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse JSON: %v", err)
 	}
-	
+
 	if result.Error != nil {
 		return "", fmt.Errorf("RPC error: %s", result.Error.Message)
 	}
-	
+
 	return result.Result, nil
+}
+
+// getChainID gets the chain ID from the network
+func (t *TransactionTPS) getChainID() (*big.Int, error) {
+	jsonData := `{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}`
+
+	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("HTTP error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	// Parse the response manually
+	var result struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  string `json:"result"`
+		Error   *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	}
+
+	if result.Error != nil {
+		return nil, fmt.Errorf("RPC error: %s", result.Error.Message)
+	}
+
+	// Parse hex chain ID
+	if strings.HasPrefix(result.Result, "0x") {
+		hexStr := result.Result[2:] // Remove "0x" prefix
+		// Pad with leading zero if odd length
+		if len(hexStr)%2 != 0 {
+			hexStr = "0" + hexStr
+		}
+		chainID, err := strconv.ParseUint(hexStr, 16, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse hex chain ID: %v", err)
+		}
+		return big.NewInt(int64(chainID)), nil
+	}
+
+	return nil, fmt.Errorf("invalid hex string: %s", result.Result)
 }
 
 // getGasPrice gets the current gas price from the network
@@ -573,21 +539,21 @@ func (t *TransactionTPS) getGasPrice() (*big.Int, error) {
 			return gasPrice, nil
 		}
 	}
-	
+
 	// Get gas price from network
 	jsonData := `{"jsonrpc":"2.0","method":"eth_gasPrice","params":[],"id":1}`
-	
+
 	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("HTTP error: %v", err)
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %v", err)
 	}
-	
+
 	// Parse the response manually
 	var result struct {
 		JSONRPC string `json:"jsonrpc"`
@@ -598,15 +564,15 @@ func (t *TransactionTPS) getGasPrice() (*big.Int, error) {
 			Message string `json:"message"`
 		} `json:"error,omitempty"`
 	}
-	
+
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %v", err)
 	}
-	
+
 	if result.Error != nil {
 		return nil, fmt.Errorf("RPC error: %s", result.Error.Message)
 	}
-	
+
 	// Parse hex gas price
 	if strings.HasPrefix(result.Result, "0x") {
 		hexStr := result.Result[2:] // Remove "0x" prefix
@@ -618,164 +584,75 @@ func (t *TransactionTPS) getGasPrice() (*big.Int, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse hex gas price: %v", err)
 		}
-		
+
 		// Add 20% buffer to ensure transactions go through
 		bufferedGasPrice := new(big.Int).Mul(big.NewInt(int64(gasPrice)), big.NewInt(120))
 		bufferedGasPrice.Div(bufferedGasPrice, big.NewInt(100))
-		
+
 		return bufferedGasPrice, nil
 	}
-	
+
 	return nil, fmt.Errorf("invalid hex string: %s", result.Result)
 }
 
-// monitorRealTransaction monitors a real transaction until it's mined
-func (t *TransactionTPS) monitorRealTransaction(txHash string) {
-	// start monitoring
-	
-	startTime := time.Now()
+// monitorTransactionInclusion monitors a transaction until it's included in a block
+func (t *TransactionTPS) monitorTransactionInclusion(txHash string) {
 	maxWaitTime := 30 * time.Minute
-	
-	blockTicker := time.NewTicker(10 * time.Millisecond)
-	defer blockTicker.Stop()
-	
-	// Also check transaction receipt immediately and periodically
-	receiptTicker := time.NewTicker(5 * time.Millisecond)
-	defer receiptTicker.Stop()
-	
-	// Track the last block we've seen
-	lastKnownBlock := ""
-	
+	startTime := time.Now()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-blockTicker.C:
-			// Check for new blocks
-			currentBlock, err := t.getCurrentBlockNumber()
-			if err != nil {
-				continue
-			}
-			
-			// If we have a new block, check if it contains our transaction
-			if currentBlock != lastKnownBlock {
-				lastKnownBlock = currentBlock
-				
-				// Check if our transaction is in this new block
-				if blockNumber, timestamp := t.checkTransactionInBlock(txHash, currentBlock); blockNumber != "" {
-					// Calculate mining time using detection time (more reliable than block timestamp)
-					miningTime := time.Since(startTime)
-					fmt.Printf("Transaction %s mined in block %s (mining time %v)\n", txHash, blockNumber, miningTime)
-					
-					// Record mining time and block timestamp
-					t.responseTracker.RecordTransactionMinedInBlockWithTime(txHash, blockNumber, miningTime)
-					
-					// If we have block timestamp, use it for finalization timing
-					if timestamp > 0 {
-						go t.monitorRealTransactionFinalizationWithBlockTime(txHash, blockNumber, timestamp)
-					} else {
-						go t.monitorRealTransactionFinalization(txHash, blockNumber, startTime)
-					}
-					
-					return
-				}
-			}
-			
+		case <-ticker.C:
 			// Check if we've been waiting too long
-			if time.Since(startTime) > maxWaitTime { return }
-			
-		case <-receiptTicker.C:
-			// Check transaction receipt for immediate confirmation
-			if blockNumber, timestamp := t.checkTransactionReceipt(txHash); blockNumber != "" {
-				// Calculate mining time using detection time (more reliable than block timestamp)
-				miningTime := time.Since(startTime)
-				fmt.Printf("Transaction %s confirmed via receipt in block %s (mining time %v)\n", txHash, blockNumber, miningTime)
-				
-				// Record mining time
-				t.responseTracker.RecordTransactionMinedInBlockWithTime(txHash, blockNumber, miningTime)
-				
-				// If we have block timestamp, use it for finalization timing
-				if timestamp > 0 {
-					go t.monitorRealTransactionFinalizationWithBlockTime(txHash, blockNumber, timestamp)
-				} else {
-					go t.monitorRealTransactionFinalization(txHash, blockNumber, startTime)
-				}
-				
+			if time.Since(startTime) > maxWaitTime {
+				fmt.Printf("Transaction %s timed out waiting for inclusion\n", txHash)
 				return
 			}
-			
-			// quiet while checking
-		}
-	}
-}
 
-// checkTransactionInBlock checks if a transaction is included in a specific block
-func (t *TransactionTPS) checkTransactionInBlock(txHash string, blockNumber string) (string, int64) {
-	// Use eth_getBlockByNumber to get block details and check if it contains our transaction
-	formattedBlockNumber := blockNumber
-	if strings.HasPrefix(blockNumber, "x") {
-		formattedBlockNumber = "0x" + blockNumber[1:]
-	} else if !strings.HasPrefix(blockNumber, "0x") {
-		formattedBlockNumber = "0x" + blockNumber
-	}
-	
-	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["%s",true],"id":1}`, formattedBlockNumber)
-	
-	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
-	if err != nil {
-		return "", 0
-	}
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", 0
-	}
-	
-	responseStr := string(body)
-	
-	// Check if the block contains our transaction
-	if strings.Contains(responseStr, txHash) {
-		// Extract block timestamp
-		timestampStart := strings.Index(responseStr, `"timestamp":"`) + 13
-		if timestampStart > 12 {
-			timestampEnd := strings.Index(responseStr[timestampStart:], `"`)
-			if timestampEnd > 0 {
-				timestampStr := responseStr[timestampStart : timestampStart+timestampEnd]
-				// Handle hex (0x...) or decimal timestamp formats
-				if strings.HasPrefix(timestampStr, "0x") || strings.HasPrefix(timestampStr, "0X") {
-					if v, err := strconv.ParseUint(timestampStr[2:], 16, 64); err == nil {
-						return blockNumber, int64(v)
-					}
-				} else {
-					if v, err := strconv.ParseInt(timestampStr, 10, 64); err == nil {
-						return blockNumber, v
-					}
+			// Check transaction receipt for immediate confirmation
+			if blockNumber, timestamp := t.checkTransactionReceipt(txHash); blockNumber != "" {
+				fmt.Printf("Transaction %s included in block %s\n", txHash, blockNumber)
+
+				// Record transaction as mined with block info
+				t.responseTracker.RecordTransactionMinedInBlock(txHash, blockNumber)
+
+				// Record finalization time as block timestamp
+				if timestamp > 0 {
+					blockTime := time.Unix(timestamp, 0)
+					// Store block timestamp as finalization time
+					t.responseTracker.RecordTransactionFinalized(txHash, blockTime)
+					// Also record block finalization with timestamp
+					t.responseTracker.RecordBlockFinalized(blockNumber, blockTime)
+					t.logFinalizedTx(txHash)
 				}
+
+				return
 			}
 		}
-		return blockNumber, 0
 	}
-	
-	return "", 0
 }
 
 // checkTransactionReceipt checks transaction receipt for immediate confirmation
 func (t *TransactionTPS) checkTransactionReceipt(txHash string) (string, int64) {
 	// Use eth_getTransactionReceipt for immediate confirmation
 	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["%s"],"id":1}`, txHash)
-	
+
 	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
 	if err != nil {
 		return "", 0
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", 0
 	}
-	
+
 	responseStr := string(body)
-	
+
 	// Check if receipt exists and contains block number
 	if responseStr != "" && responseStr != "null" && !strings.Contains(responseStr, `"blockNumber":null`) && strings.Contains(responseStr, `"blockNumber"`) {
 		// Extract block number from receipt
@@ -792,18 +669,18 @@ func (t *TransactionTPS) checkTransactionReceipt(txHash string) (string, int64) 
 				} else {
 					formattedBlockNumber = blockNumber
 				}
-				
+
 				// Try to get block timestamp for accurate timing
 				// We need to make another call to get the block details
 				if timestamp := t.getBlockTimestamp(formattedBlockNumber); timestamp > 0 {
 					return formattedBlockNumber, timestamp
 				}
-				
+
 				return formattedBlockNumber, 0
 			}
 		}
 	}
-	
+
 	return "", 0
 }
 
@@ -815,22 +692,22 @@ func (t *TransactionTPS) getBlockTimestamp(blockNumber string) int64 {
 	} else if !strings.HasPrefix(blockNumber, "0x") {
 		formattedBlockNumber = "0x" + blockNumber
 	}
-	
+
 	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["%s",false],"id":1}`, formattedBlockNumber)
-	
+
 	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
 	if err != nil {
 		return 0
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0
 	}
-	
+
 	responseStr := string(body)
-	
+
 	// Extract block timestamp
 	timestampStart := strings.Index(responseStr, `"timestamp":"`) + 13
 	if timestampStart > 12 {
@@ -849,194 +726,25 @@ func (t *TransactionTPS) getBlockTimestamp(blockNumber string) int64 {
 			}
 		}
 	}
-	
+
 	return 0
-}
-
-// monitorRealTransactionFinalizationWithBlockTime monitors a transaction for finalization using block timestamp
-func (t *TransactionTPS) monitorRealTransactionFinalizationWithBlockTime(txHash string, blockNumber string, blockTimestamp int64) {
-	// Start finalization monitoring timing
-	t.responseTracker.StartTransactionFinalizationMonitoring(txHash)
-	
-	blockTime := time.Unix(blockTimestamp, 0)
-	maxWaitTime := 2 * time.Minute
-	startTime := time.Now()
-	
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
-	
-	// Check if the original block is accepted immediately
-	if t.isBlockAccepted(blockNumber) {
-		// Calculate finalization time from block timestamp to acceptance
-		finalizationTime := time.Since(blockTime)
-		if finalizationTime < 0 {
-			finalizationTime = time.Since(startTime) // Fallback if negative
-		}
-		fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
-		
-		// Record finalization time for this transaction and all others in the same block
-		t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-		t.logFinalizedTx(txHash)
-		t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
-		t.logFinalizedTxsInBlock(blockNumber)
-		return
-	}
-	
-	// If original block not accepted, monitor for potential re-mining
-	attempts := 0
-	maxAttempts := 300
-	
-	for attempts < maxAttempts {
-		select {
-		case <-ticker.C:
-			attempts++
-			
-			// timeout handling
-			if time.Since(startTime) > maxWaitTime { 
-				// Mark as finalized even if timeout (block is likely accepted)
-				finalizationTime := time.Since(blockTime)
-				if finalizationTime < 0 {
-					finalizationTime = time.Since(startTime)
-				}
-				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-				t.logFinalizedTx(txHash)
-				return 
-			}
-			
-			// Check if the original block is now accepted
-			if t.isBlockAccepted(blockNumber) {
-				finalizationTime := time.Since(blockTime)
-				if finalizationTime < 0 {
-					finalizationTime = time.Since(startTime)
-				}
-				fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
-				
-				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-				t.logFinalizedTx(txHash)
-				t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
-				t.logFinalizedTxsInBlock(blockNumber)
-				return
-			}
-			
-			// Check if transaction was re-mined in a different block
-			if newBlockNumber := t.checkTransactionRemining(txHash); newBlockNumber != "" && newBlockNumber != blockNumber {
-				fmt.Printf("Transaction %s re-mined in block %s (from %s)\n", txHash, newBlockNumber, blockNumber)
-				
-				// Update the block association
-				t.responseTracker.RecordTransactionMinedInBlock(txHash, newBlockNumber)
-				
-				// Check if the new block is accepted
-				if t.isBlockAccepted(newBlockNumber) {
-					finalizationTime := time.Since(startTime)
-					fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, newBlockNumber, finalizationTime)
-					
-					t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-					t.logFinalizedTx(txHash)
-					return
-				}
-			}
-			
-			// quiet while checking
-		}
-	}
-
-	// fallback finalization - mark as finalized if we've been monitoring this long
-	finalizationTime := time.Since(blockTime)
-	if finalizationTime < 0 {
-		finalizationTime = time.Since(startTime)
-	}
-	t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-	t.logFinalizedTx(txHash)
-}
-
-// monitorRealTransactionFinalization monitors a transaction for finalization
-func (t *TransactionTPS) monitorRealTransactionFinalization(txHash string, blockNumber string, miningStartTime time.Time) {
-	// Start finalization monitoring timing
-	t.responseTracker.StartTransactionFinalizationMonitoring(txHash)
-	
-	startTime := time.Now()
-	maxWaitTime := 2 * time.Minute
-	
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
-	
-	// Check if the original block is accepted immediately
-	if t.isBlockAccepted(blockNumber) {
-		finalizationTime := time.Since(startTime)
-		fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
-		
-		// Record finalization time for this transaction and all others in the same block
-		t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-		t.logFinalizedTx(txHash)
-		t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
-		t.logFinalizedTxsInBlock(blockNumber)
-		return
-	}
-	
-	// If original block not accepted, monitor for potential re-mining
-	attempts := 0
-	maxAttempts := 300
-	
-	for attempts < maxAttempts {
-		select {
-		case <-ticker.C:
-			attempts++
-			
-			// timeout handling
-			if time.Since(startTime) > maxWaitTime { 
-				// Mark as finalized even if timeout (block is likely accepted)
-				t.responseTracker.RecordTransactionFinalized(txHash, time.Since(startTime))
-				t.logFinalizedTx(txHash)
-				return 
-			}
-			
-			// Check if the original block is now accepted
-			if t.isBlockAccepted(blockNumber) {
-				finalizationTime := time.Since(startTime)
-				fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, blockNumber, finalizationTime)
-				
-				t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-				t.logFinalizedTx(txHash)
-				t.responseTracker.FinalizeAllTransactionsInBlock(blockNumber, finalizationTime)
-				t.logFinalizedTxsInBlock(blockNumber)
-				return
-			}
-			
-			// Check if transaction was re-mined in a different block
-			if newBlockNumber := t.checkTransactionRemining(txHash); newBlockNumber != "" && newBlockNumber != blockNumber {
-				fmt.Printf("Transaction %s re-mined in block %s (from %s)\n", txHash, newBlockNumber, blockNumber)
-				
-				// Update the block association
-				t.responseTracker.RecordTransactionMinedInBlock(txHash, newBlockNumber)
-				
-				// Check if the new block is accepted
-				if t.isBlockAccepted(newBlockNumber) {
-					finalizationTime := time.Since(startTime)
-					fmt.Printf("Transaction %s finalized in block %s (finality %v)\n", txHash, newBlockNumber, finalizationTime)
-					
-					t.responseTracker.RecordTransactionFinalized(txHash, finalizationTime)
-					t.logFinalizedTx(txHash)
-					return
-				}
-			}
-			
-			// quiet while checking
-		}
-	}
-
-	// fallback finalization - mark as finalized if we've been monitoring this long
-	t.responseTracker.RecordTransactionFinalized(txHash, time.Since(startTime))
-	t.logFinalizedTx(txHash)
 }
 
 // logFinalizedTx appends a single finalized transaction entry to the results file (once)
 func (t *TransactionTPS) logFinalizedTx(txHash string) {
-	if t.outputFilePath == "" { return }
+	if t.outputFilePath == "" {
+		return
+	}
 
 	// prevent duplicate entries
 	t.fileWriteMu.Lock()
-	if t.finalizedLogged == nil { t.finalizedLogged = make(map[string]bool) }
-	if t.finalizedLogged[txHash] { t.fileWriteMu.Unlock(); return }
+	if t.finalizedLogged == nil {
+		t.finalizedLogged = make(map[string]bool)
+	}
+	if t.finalizedLogged[txHash] {
+		t.fileWriteMu.Unlock()
+		return
+	}
 	t.fileWriteMu.Unlock()
 
 	// fetch timing info for this tx
@@ -1045,31 +753,47 @@ func (t *TransactionTPS) logFinalizedTx(txHash string) {
 
 	// open file for append
 	f, err := os.OpenFile(t.outputFilePath, os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer f.Close()
 
 	// prepare fields
 	shortHash := txHash
-	if len(txHash) > 20 { shortHash = txHash[:10] + "..." + txHash[len(txHash)-10:] }
+	if len(txHash) > 20 {
+		shortHash = txHash[:10] + "..." + txHash[len(txHash)-10:]
+	}
 	var blockStr string
 	if exists {
-		if bn, ok := timing["blockNumber"].(string); ok { blockStr = bn }
+		if bn, ok := timing["blockNumber"].(string); ok {
+			blockStr = bn
+		}
 	}
 	var finTimeStr string
 	if exists {
-		if ft, ok := timing["finalizationTime"].(time.Duration); ok { finTimeStr = ft.String() }
+		if ft, ok := timing["finalizationTime"].(time.Duration); ok {
+			finTimeStr = ft.String()
+		}
 	}
 	var miningTimeStr string
 	if exists {
-		if mt, ok := timing["miningTime"].(time.Duration); ok { miningTimeStr = mt.String() }
+		if mt, ok := timing["miningTime"].(time.Duration); ok {
+			miningTimeStr = mt.String()
+		}
 	}
 
 	// write entry
 	if blockStr != "" || finTimeStr != "" || miningTimeStr != "" {
 		fmt.Fprintf(f, "Finalized: %s", shortHash)
-		if blockStr != "" { fmt.Fprintf(f, " | Block: %s", blockStr) }
-		if miningTimeStr != "" { fmt.Fprintf(f, " | Mining: %s", miningTimeStr) }
-		if finTimeStr != "" { fmt.Fprintf(f, " | Finality: %s", finTimeStr) }
+		if blockStr != "" {
+			fmt.Fprintf(f, " | Block: %s", blockStr)
+		}
+		if miningTimeStr != "" {
+			fmt.Fprintf(f, " | Mining: %s", miningTimeStr)
+		}
+		if finTimeStr != "" {
+			fmt.Fprintf(f, " | Finality: %s", finTimeStr)
+		}
 		fmt.Fprintln(f)
 	} else {
 		fmt.Fprintf(f, "Finalized: %s\n", shortHash)
@@ -1079,232 +803,4 @@ func (t *TransactionTPS) logFinalizedTx(txHash string) {
 	t.fileWriteMu.Lock()
 	t.finalizedLogged[txHash] = true
 	t.fileWriteMu.Unlock()
-}
-
-// logFinalizedTxsInBlock appends all finalized txs in a block (skipping ones already logged)
-func (t *TransactionTPS) logFinalizedTxsInBlock(blockNumber string) {
-	ind := t.responseTracker.GetIndividualTransactionTimings()
-	for txHash, timing := range ind {
-		bn, ok := timing["blockNumber"].(string)
-		if !ok || bn != blockNumber { continue }
-		if finalized, ok := timing["finalized"].(bool); ok && finalized {
-			t.logFinalizedTx(txHash)
-		}
-	}
-}
-
-// logAllFinalizedNotLogged appends any finalized txs that haven't been logged yet
-func (t *TransactionTPS) logAllFinalizedNotLogged() {
-	ind := t.responseTracker.GetIndividualTransactionTimings()
-	for txHash, timing := range ind {
-		if finalized, ok := timing["finalized"].(bool); ok && finalized {
-			// check logged flag
-			t.fileWriteMu.Lock()
-			already := t.finalizedLogged != nil && t.finalizedLogged[txHash]
-			t.fileWriteMu.Unlock()
-			if !already { t.logFinalizedTx(txHash) }
-		}
-	}
-}
-
-// checkTransactionRemining checks if a transaction was re-mined in a different block
-func (t *TransactionTPS) checkTransactionRemining(txHash string) string {
-	// Use eth_getTransactionByHash to check current block
-	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["%s"],"id":1}`, txHash)
-	
-	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	
-	responseStr := string(body)
-	
-	// Extract current block number
-	if strings.Contains(responseStr, `"blockNumber"`) && !strings.Contains(responseStr, `"blockNumber":null`) {
-		blockStart := strings.Index(responseStr, `"blockNumber":"`) + 16
-		blockEnd := strings.Index(responseStr[blockStart:], `"`)
-		if blockEnd > 0 {
-			blockNumber := responseStr[blockStart : blockStart+blockEnd]
-			if blockNumber != "0x0" {
-				return blockNumber
-			}
-		}
-	}
-	
-	return ""
-}
-
-// monitorBlockFinalization monitors a block for finalization (if the chain supports it)
-func (t *TransactionTPS) monitorBlockFinalization(blockNumber string, txHash string) {	
-	startTime := time.Now()
-	maxWaitTime := 2 * time.Second 
-	
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	
-	// Check if the block is accepted by consensus
-	if t.isBlockAccepted(blockNumber) { t.responseTracker.RecordBlockFinalized(blockNumber); return }
-	
-	// If not immediately accepted, monitor for a short time
-	for attempts := 0; attempts < 10; attempts++ {
-		select {
-		case <-ticker.C:
-			// Check if we've been waiting too long
-			if time.Since(startTime) > maxWaitTime { return }
-			
-			// Check if the block is now accepted
-			if t.isBlockAccepted(blockNumber) { t.responseTracker.RecordBlockFinalized(blockNumber); return }
-			
-			// Also check confirmations as a fallback
-			currentBlock, err := t.getCurrentBlockNumber()
-			if err == nil {
-				if blockNum, currentBlockNum, err := t.parseBlockNumbers(blockNumber, currentBlock); err == nil {
-					confirmations := int(currentBlockNum - blockNum)
-					if confirmations >= 2 { t.responseTracker.RecordBlockFinalized(blockNumber); return }
-				}
-			}
-			
-			// quiet while checking
-		}
-	}
-	
-	t.responseTracker.RecordBlockFinalized(blockNumber)
-}
-
-// getCurrentBlockNumber gets the current block number from the network
-func (t *TransactionTPS) getCurrentBlockNumber() (string, error) {
-	jsonData := `{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`
-	
-	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("HTTP error: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %v", err)
-	}
-	
-	// Parse the response manually
-	var result struct {
-		JSONRPC string `json:"jsonrpc"`
-		ID      int    `json:"id"`
-		Result  string `json:"result"`
-		Error   *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-	
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse JSON: %v", err)
-	}
-	
-	if result.Error != nil {
-		return "", fmt.Errorf("RPC error: %s", result.Error.Message)
-	}
-	
-	return result.Result, nil
-}
-
-// parseBlockNumbers parses hex block numbers and returns them as uint64
-func (t *TransactionTPS) parseBlockNumbers(block1, block2 string) (uint64, uint64, error) {
-	// Parse first block number
-	var block1Num uint64
-	if strings.HasPrefix(block1, "0x") {
-		hexStr := block1[2:] // Remove "0x" prefix
-		if len(hexStr)%2 != 0 {
-			hexStr = "0" + hexStr
-		}
-		var err error
-		block1Num, err = strconv.ParseUint(hexStr, 16, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse block number %s: %v", block1, err)
-		}
-	} else {
-		var err error
-		block1Num, err = strconv.ParseUint(block1, 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse block number %s: %v", block1, err)
-		}
-	}
-	
-	// Parse second block number
-	var block2Num uint64
-	if strings.HasPrefix(block2, "0x") {
-		hexStr := block2[2:] // Remove "0x" prefix
-		if len(hexStr)%2 != 0 {
-			hexStr = "0" + hexStr
-		}
-		var err error
-		block2Num, err = strconv.ParseUint(hexStr, 16, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse block number %s: %v", block2, err)
-		}
-	} else {
-		var err error
-		block2Num, err = strconv.ParseUint(block2, 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse block number %s: %v", block2, err)
-		}
-	}
-	
-	return block1Num, block2Num, nil
-}
-
-// isBlockAccepted checks if a block is accepted by consensus mechanism
-func (t *TransactionTPS) isBlockAccepted(blockNumber string) bool {
-	formattedBlockNumber := blockNumber
-	if strings.HasPrefix(blockNumber, "x") {
-		// Convert x1f4d10 to 0x1f4d10
-		formattedBlockNumber = "0x" + blockNumber[1:]
-	} else if !strings.HasPrefix(blockNumber, "0x") {
-		formattedBlockNumber = "0x" + blockNumber
-	}
-	
-	// Method 1: Check if the block has a valid block hash (not null)
-	jsonData := fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["%s",false],"id":1}`, formattedBlockNumber)
-	
-	resp, err := http.Post(t.nodeURL, "application/json", strings.NewReader(jsonData))
-	if err != nil { return false }
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil { return false }
-	
-	responseStr := string(body)
-	
-	// If the response contains a valid block hash (not null), the block is accepted
-	if responseStr != "" && responseStr != "null" && !strings.Contains(responseStr, `"hash":null`) && strings.Contains(responseStr, `"hash"`) {
-		// Extract hash to verify it's not null
-		hashStart := strings.Index(responseStr, `"hash":"`) + 8
-		hashEnd := strings.Index(responseStr[hashStart:], `"`)
-		if hashEnd > 0 {
-			hash := responseStr[hashStart : hashStart+hashEnd]
-			if hash != "null" && hash != "0x0000000000000000000000000000000000000000000000000000000000000000" { return true }
-		}
-	}
-	
-	// Method 2: Check if the block has transactions (indicates it was properly mined)
-	if strings.Contains(responseStr, `"transactions"`) && !strings.Contains(responseStr, `"transactions":[]`) { return true }
-	
-	// Method 3: Check if the block has a valid number and timestamp
-	if strings.Contains(responseStr, `"number"`) && strings.Contains(responseStr, `"timestamp"`) {
-		// Extract block number to verify it matches
-		numberStart := strings.Index(responseStr, `"number":"`) + 10
-		numberEnd := strings.Index(responseStr[numberStart:], `"`)
-		if numberEnd > 0 {
-			number := responseStr[numberStart : numberStart+numberEnd]
-			if number == formattedBlockNumber { return true }
-		}
-	}
-	
-	return false
 }
