@@ -113,7 +113,7 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 	}
 
 	sendDuration := time.Since(startTime)
-	fmt.Printf("All %d transactions sent in %v (%.2f TPS)\n", sentCount, sendDuration, float64(sentCount)/sendDuration.Seconds())
+	fmt.Printf("All %d transactions sent in %v\n", sentCount, sendDuration)
 
 	// If no transactions were sent successfully, exit early
 	if sentCount == 0 {
@@ -174,7 +174,6 @@ done:
 
 	// Calculate final TPS
 	totalDuration := time.Since(startTime)
-	finalTPS := float64(mined) / totalDuration.Seconds()
 
 	fmt.Printf("\nFinal Transaction TPS Test Results:\n")
 	fmt.Printf("=====================================\n")
@@ -182,7 +181,6 @@ done:
 	fmt.Printf("Total Included in Blocks: %d\n", mined)
 	fmt.Printf("Send Duration: %v\n", sendDuration)
 	fmt.Printf("Total Duration: %v\n", totalDuration)
-	fmt.Printf("Final TPS: %.4f\n", finalTPS)
 	fmt.Printf("Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
 
 	// Show individual transaction breakdowns
@@ -250,9 +248,14 @@ done:
 
 	fmt.Printf("\nBlock Inclusion Summary:\n")
 	fmt.Printf("========================\n")
+	var maxCount int
 	for _, be := range blocks {
 		fmt.Printf("Block %s: %d tx\n", be.block, be.count)
+		if be.count > maxCount {
+			maxCount = be.count
+		}
 	}
+	fmt.Printf("Maximum number of transactions in a block: %d\n", maxCount)
 
 	// Write final results to file
 	if file != nil {
@@ -262,7 +265,6 @@ done:
 		fmt.Fprintf(file, "Total Included in Blocks: %d\n", mined)
 		fmt.Fprintf(file, "Send Duration: %v\n", sendDuration)
 		fmt.Fprintf(file, "Total Duration: %v\n", totalDuration)
-		fmt.Fprintf(file, "Final TPS: %.4f\n", finalTPS)
 		fmt.Fprintf(file, "Success Rate: %.1f%%\n", float64(mined)/float64(sent)*100)
 
 		// Individual breakdown
@@ -424,11 +426,11 @@ func (t *TransactionTPS) sendRealTransaction(nonce uint64) (string, error) {
 	)
 
 	// Sign transaction with hardcoded chain ID (131313 for local testnet)
-	// chainID, err := t.getChainID()
-	// if err != nil {
-	// 	return "", fmt.Errorf("failed to get chain ID: %v", err)
-	// }
-	signer := types.NewEIP155Signer(big.NewInt(43112))
+	chainID, err := t.getChainID()
+	if err != nil {
+		return "", fmt.Errorf("failed to get chain ID: %v", err)
+	}
+	signer := types.NewEIP155Signer(chainID)
 	signedTx, err := types.SignTx(tx, signer, t.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %v", err)

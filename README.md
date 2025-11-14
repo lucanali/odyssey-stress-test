@@ -23,7 +23,7 @@ This is a Go implementation of the Dione node stress testing script, providing t
 3. Build the binary:
 
 ```bash
-go build -o stress-test main.go
+go build -o stress-test
 ```
 
 ## Configuration
@@ -42,6 +42,8 @@ export ODYSSEY_TEST_ACCOUNT="0x1234567890abcdef..."
 # Optional: Set custom test parameters
 export DURATION=60        # 60 seconds sustained load test
 export ITERATIONS=200     # 200 concurrent requests
+# Optional: Enable transaction TPS testing (requires funded key)
+export PRIVATE_KEY="0xabc123..."  # Hex-encoded private key
 
 # Run the stress test
 ./stress-test
@@ -59,6 +61,14 @@ The stress test requires these environment variables to be set:
 - **ODYSSEY_TEST_ACCOUNT**: Test account address for balance checks (required)
 - **DURATION**: Duration of sustained load test in seconds (optional, default: 30)
 - **ITERATIONS**: Number of concurrent requests (optional, default: 100)
+- **PRIVATE_KEY**: Hex-encoded private key used to sign transactions for the TPS test (optional, but required to run `transaction-tps`)
+
+#### Transaction TPS Requirements
+
+- The private key must hold sufficient balance on the target network to cover gas fees.
+- Store it in the `PRIVATE_KEY` environment variable (no quotes in the value).
+- Never commit the private key to version control; consider using a `.env` file or shell export.
+- Only use disposable test accounts; this feature repeatedly sends signed transactions.
 
 ### RPC Endpoint Requirements
 
@@ -116,6 +126,7 @@ You can specify which tests to run by providing test names as command line argum
 ./stress-test concurrent-block
 ./stress-test mixed-methods
 ./stress-test sustained-load
+./stress-test transaction-tps
 
 # Run multiple specific tests
 ./stress-test basic-rpc concurrent-block
@@ -132,6 +143,7 @@ You can specify which tests to run by providing test names as command line argum
 - **`concurrent-chain`**: Tests concurrent chain ID requests  
 - **`mixed-methods`**: Tests various RPC methods concurrently
 - **`sustained-load`**: Runs continuous requests for specified duration
+- **`transaction-tps`**: Measures signed transaction throughput (requires `PRIVATE_KEY`)
 - **`all`**: Runs all tests (default when no arguments provided)
 
 ## Output
