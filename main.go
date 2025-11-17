@@ -83,26 +83,6 @@ type TransactionReceipt struct {
 	EffectiveGasPrice string `json:"effectiveGasPrice"`
 }
 
-// Performance metrics structure
-type PerformanceMetrics struct {
-	StartTime time.Time
-	EndTime   time.Time
-	Duration  time.Duration
-	Requests  int
-	Errors    int
-	// New fields for response time tracking
-	TotalResponseTime time.Duration
-	MinResponseTime   time.Duration
-	MaxResponseTime   time.Duration
-	ResponseTimes     []time.Duration // Store individual response times for percentiles
-	// Transaction-specific metrics
-	TransactionsSent  int
-	TransactionsMined int
-	TransactionTPS    float64
-	AverageMiningTime time.Duration
-	MiningTimes       []time.Duration
-}
-
 // ResponseTimeTracker tracks individual request response times
 type ResponseTimeTracker struct {
 	mu            sync.RWMutex
@@ -115,16 +95,9 @@ type ResponseTimeTracker struct {
 	transactionsSent       int
 	transactionsMined      int
 	// Enhanced timing tracking
-	transactionSendTimes    map[string]time.Duration // Track actual sending time for each transaction
 	blockFinalizationTimes  map[string]time.Time     // Track block finalization time
 	transactionBlocks       map[string]string        // Track which block each transaction was mined in
 	blockFinalizationStatus map[string]bool          // Track finalization status of blocks
-	// Individual transaction timing tracking
-	transactionMiningStartTimes       map[string]time.Time     // Track when each transaction started being monitored for mining
-	transactionMiningEndTimes         map[string]time.Time     // Track when each transaction was actually mined
-	transactionFinalizationStartTimes map[string]time.Time     // Track when finalization monitoring started
-	transactionFinalizationEndTimes   map[string]time.Time     // Track when finalization completed
-	transactionMiningTimeByHash       map[string]time.Duration // Mining time per transaction
 }
 
 // NewResponseTimeTracker creates a new response time tracker
@@ -135,15 +108,9 @@ func NewResponseTimeTracker() *ResponseTimeTracker {
 		startTime:                         time.Now(),
 		transactionStartTimes:             make(map[string]time.Time),
 		transactionMiningTimes:            make([]time.Duration, 0),
-		transactionSendTimes:              make(map[string]time.Duration),
 		blockFinalizationTimes:            make(map[string]time.Time),
 		transactionBlocks:                 make(map[string]string),
 		blockFinalizationStatus:           make(map[string]bool),
-		transactionMiningStartTimes:       make(map[string]time.Time),
-		transactionMiningEndTimes:         make(map[string]time.Time),
-		transactionFinalizationStartTimes: make(map[string]time.Time),
-		transactionFinalizationEndTimes:   make(map[string]time.Time),
-		transactionMiningTimeByHash:       make(map[string]time.Duration),
 	}
 }
 
@@ -156,12 +123,12 @@ func (rt *ResponseTimeTracker) RecordResponseTime(responseTime time.Duration) {
 }
 
 // GetStats returns response time statistics
-func (rt *ResponseTimeTracker) GetStats() (min, max, avg time.Duration, p50, p95, p99 time.Duration) {
+func (rt *ResponseTimeTracker) GetStats() (min, max, avg time.Duration) {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
 	if len(rt.responseTimes) == 0 {
-		return 0, 0, 0, 0, 0, 0
+		return 0, 0, 0
 	}
 
 	// Sort response times for percentile calculations
@@ -181,12 +148,7 @@ func (rt *ResponseTimeTracker) GetStats() (min, max, avg time.Duration, p50, p95
 	}
 	avg = total / time.Duration(len(times))
 
-	// Calculate percentiles
-	p50 = times[len(times)*50/100]
-	p95 = times[len(times)*95/100]
-	p99 = times[len(times)*99/100]
-
-	return min, max, avg, p50, p95, p99
+	return min, max, avg
 }
 
 // GetCurrentTPS calculates current transactions per second
@@ -227,15 +189,6 @@ func (rt *ResponseTimeTracker) RecordTransactionSent(txHash string) {
 	rt.transactionsSent++
 }
 
-// RecordTransactionSentWithTime records when a transaction is sent with its actual sending time
-func (rt *ResponseTimeTracker) RecordTransactionSentWithTime(txHash string, sendTime time.Duration) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	rt.transactionStartTimes[txHash] = time.Now()
-	rt.transactionSendTimes[txHash] = sendTime
-	rt.transactionsSent++
-}
-
 // RecordTransactionMined records when a transaction is mined
 func (rt *ResponseTimeTracker) RecordTransactionMined(txHash string) {
 	rt.mu.Lock()
@@ -249,17 +202,6 @@ func (rt *ResponseTimeTracker) RecordTransactionMined(txHash string) {
 	}
 }
 
-// GetTransactionStartTime returns the start time for a specific transaction
-func (rt *ResponseTimeTracker) GetTransactionStartTime(txHash string) time.Time {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	if startTime, exists := rt.transactionStartTimes[txHash]; exists {
-		return startTime
-	}
-	return time.Time{}
-}
-
 // RecordTransactionMinedInBlock records when a transaction is mined with block information
 func (rt *ResponseTimeTracker) RecordTransactionMinedInBlock(txHash string, blockNumber string) {
 	rt.mu.Lock()
@@ -270,21 +212,6 @@ func (rt *ResponseTimeTracker) RecordTransactionMinedInBlock(txHash string, bloc
 	rt.transactionsMined++
 	// Clean up any start time tracking if present
 	delete(rt.transactionStartTimes, txHash)
-}
-
-// RecordTransactionMinedInBlockWithTime records when a transaction is mined with accurate mining time
-func (rt *ResponseTimeTracker) RecordTransactionMinedInBlockWithTime(txHash string, blockNumber string, miningTime time.Duration) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-
-	if _, exists := rt.transactionStartTimes[txHash]; exists {
-		rt.transactionMiningTimes = append(rt.transactionMiningTimes, miningTime)
-		rt.transactionMiningTimeByHash[txHash] = miningTime
-		rt.transactionBlocks[txHash] = blockNumber
-		rt.transactionMiningEndTimes[txHash] = time.Now() // Record when mining completed
-		rt.transactionsMined++
-		delete(rt.transactionStartTimes, txHash) // Clean up
-	}
 }
 
 // RecordBlockFinalized records when a block is finalized
@@ -310,34 +237,12 @@ func (rt *ResponseTimeTracker) RecordTransactionFinalized(txHash string, finaliz
 
 	// Record the finalization time for this specific transaction
 	rt.blockFinalizationTimes[txHash] = finalizationTime
-	rt.transactionFinalizationEndTimes[txHash] = time.Now() // Record when finalization completed
 
 	// Mark that this transaction has been finalized
 	if _, exists := rt.transactionBlocks[txHash]; exists {
 		// Transaction was mined, now it's finalized
 		fmt.Printf("Debug: Transaction %s finalized at %v\n", txHash, finalizationTime)
 	}
-}
-
-// FinalizeAllTransactionsInBlock marks all transactions in a specific block as finalized
-func (rt *ResponseTimeTracker) FinalizeAllTransactionsInBlock(blockNumber string, blockTimestamp time.Time) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-
-	// Find all transactions in this block and mark them as finalized
-	for txHash, blockNum := range rt.transactionBlocks {
-		if blockNum == blockNumber {
-			rt.blockFinalizationTimes[txHash] = blockTimestamp
-			rt.transactionFinalizationEndTimes[txHash] = time.Now()
-		}
-	}
-}
-
-// StartTransactionFinalizationMonitoring records when finalization monitoring starts for a transaction
-func (rt *ResponseTimeTracker) StartTransactionFinalizationMonitoring(txHash string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	rt.transactionFinalizationStartTimes[txHash] = time.Now()
 }
 
 // GetTransactionStats returns transaction statistics
@@ -375,71 +280,6 @@ func (rt *ResponseTimeTracker) GetTransactionStats() (sent, mined int, avgMining
 	return sent, mined, avgMiningTime, miningTPS
 }
 
-// GetDetailedTransactionStats returns comprehensive transaction timing statistics
-func (rt *ResponseTimeTracker) GetDetailedTransactionStats() (sent, mined int, avgSendTime, avgMiningTime, avgFinalizationTime time.Duration, miningTPS float64) {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	sent = rt.transactionsSent
-	mined = rt.transactionsMined
-
-	// Initialize all timing variables
-	avgSendTime = 0
-	avgMiningTime = 0
-	avgFinalizationTime = 0
-	miningTPS = 0
-
-	// Calculate average sending time
-	if len(rt.transactionSendTimes) > 0 {
-		var totalSendTime time.Duration
-		for _, t := range rt.transactionSendTimes {
-			totalSendTime += t
-		}
-		avgSendTime = totalSendTime / time.Duration(len(rt.transactionSendTimes))
-	}
-
-	// Calculate average mining time
-	if len(rt.transactionMiningTimes) > 0 {
-		var totalMiningTime time.Duration
-		for _, t := range rt.transactionMiningTimes {
-			totalMiningTime += t
-		}
-		avgMiningTime = totalMiningTime / time.Duration(len(rt.transactionMiningTimes))
-	}
-
-	// Calculate mining TPS
-	if len(rt.transactionMiningTimes) > 0 {
-		recentMined := len(rt.transactionMiningTimes)
-		if recentMined > 10 {
-			recentMined = 10
-		}
-
-		if recentMined > 0 {
-			miningTPS = float64(recentMined) / 10.0
-		}
-	}
-
-	return sent, mined, avgSendTime, avgMiningTime, avgFinalizationTime, miningTPS
-}
-
-// GetTransactionFinalizationStatus returns the finalization status of all transactions
-func (rt *ResponseTimeTracker) GetTransactionFinalizationStatus() map[string]bool {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	status := make(map[string]bool)
-	for txHash := range rt.transactionBlocks {
-		// Check if this transaction has been finalized
-		if _, finalized := rt.blockFinalizationTimes[txHash]; finalized {
-			status[txHash] = true
-		} else {
-			status[txHash] = false
-		}
-	}
-
-	return status
-}
-
 // GetIndividualTransactionTimings returns detailed timing information for each transaction
 func (rt *ResponseTimeTracker) GetIndividualTransactionTimings() map[string]map[string]interface{} {
 	rt.mu.RLock()
@@ -452,16 +292,6 @@ func (rt *ResponseTimeTracker) GetIndividualTransactionTimings() map[string]map[
 
 		// Get block number
 		txTiming["blockNumber"] = blockNumber
-
-		// Send time
-		if sendTime, exists := rt.transactionSendTimes[txHash]; exists {
-			txTiming["sendTime"] = sendTime
-		}
-
-		// Mining time
-		if miningTime, exists := rt.transactionMiningTimeByHash[txHash]; exists {
-			txTiming["miningTime"] = miningTime
-		}
 
 		// Finalization time
 		if finalizationTime, exists := rt.blockFinalizationTimes[txHash]; exists {
@@ -479,31 +309,6 @@ func (rt *ResponseTimeTracker) GetIndividualTransactionTimings() map[string]map[
 	}
 
 	return individualTimings
-}
-
-// GetDetailedTransactionTimings returns comprehensive timing breakdown for each transaction
-func (rt *ResponseTimeTracker) GetDetailedTransactionTimings() []map[string]interface{} {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	var detailedTimings []map[string]interface{}
-
-	for i, miningTime := range rt.transactionMiningTimes {
-		if i < len(rt.transactionMiningTimes) {
-			txInfo := map[string]interface{}{
-				"index":            i + 1,
-				"miningTime":       miningTime,
-				"finalized":        false,
-				"finalizationTime": time.Duration(0),
-			}
-
-			// Try to find finalization time
-			// This is a simplified approach - ideally you'd maintain direct mappings
-			detailedTimings = append(detailedTimings, txInfo)
-		}
-	}
-
-	return detailedTimings
 }
 
 // StressTest holds the test configuration and state
@@ -576,7 +381,8 @@ func (tr *TestRunner) RunTests() error {
 
 // runAllTests runs all available tests
 func (tr *TestRunner) runAllTests() {
-	tr.st.getInitialMetrics()
+	tr.st.startTime = time.Now()
+	fmt.Printf("Start Time: %s\n", tr.st.startTime.Format("15:04:05"))
 	tr.st.testBasicRPC()
 	tr.st.testConcurrentRequests(tr.st.iterations, "eth_blockNumber", "block number requests")
 	tr.st.testConcurrentRequests(tr.st.iterations, "eth_chainId", "chain ID requests")
@@ -670,30 +476,6 @@ func (st *StressTest) checkNodeStatus() error {
 
 	fmt.Printf("Node is accessible - Chain ID: %v\n", resp.Result)
 	return nil
-}
-
-// getPerformanceMetrics returns current performance metrics
-func (st *StressTest) getPerformanceMetrics() *PerformanceMetrics {
-	return &PerformanceMetrics{
-		StartTime: st.startTime,
-		EndTime:   time.Now(),
-		Duration:  time.Since(st.startTime),
-		Requests:  0, // Will be updated during tests
-		Errors:    0, // Will be updated during tests
-	}
-}
-
-// getInitialMetrics displays initial performance metrics
-func (st *StressTest) getInitialMetrics() {
-	fmt.Println("Getting initial performance metrics...")
-
-	// Set start time for metrics
-	st.startTime = time.Now()
-
-	fmt.Printf("Start Time: %s\n", st.startTime.Format("15:04:05"))
-	fmt.Printf("Test Duration: %ds\n", st.duration)
-	fmt.Printf("Test Iterations: %d\n", st.iterations)
-	fmt.Println()
 }
 
 // makeRPCRequest makes a single RPC request to the node
@@ -992,23 +774,16 @@ func (st *StressTest) testTransactionTPS() {
 func (st *StressTest) getFinalMetrics() {
 	fmt.Println("Getting final performance metrics...")
 
-	metrics := st.getPerformanceMetrics()
-
-	fmt.Printf("Total Duration: %v\n", metrics.Duration)
-	fmt.Printf("Total Requests: %d\n", metrics.Requests)
-	fmt.Printf("Total Errors: %d\n", metrics.Errors)
-	fmt.Printf("Overall Requests per Second: %.2f\n", float64(metrics.Requests)/metrics.Duration.Seconds())
+	duration := time.Since(st.startTime)
+	fmt.Printf("Total Duration: %v\n", duration)
 
 	// Show detailed response time statistics
 	if st.responseTracker != nil {
-		min, max, avg, p50, p95, p99 := st.responseTracker.GetStats()
+		min, max, avg := st.responseTracker.GetStats()
 		fmt.Println("\nResponse Time Statistics:")
 		fmt.Printf("  Min Response Time: %v\n", min)
 		fmt.Printf("  Max Response Time: %v\n", max)
 		fmt.Printf("  Average Response Time: %v\n", avg)
-		fmt.Printf("  50th Percentile (P50): %v\n", p50)
-		fmt.Printf("  95th Percentile (P95): %v\n", p95)
-		fmt.Printf("  99th Percentile (P99): %v\n", p99)
 
 		// Show current TPS
 		currentTPS := st.responseTracker.GetCurrentTPS()
@@ -1056,18 +831,12 @@ func (st *StressTest) generateReport() {
 		fmt.Printf("Peak TPS Achieved: %.2f\n", currentTPS)
 
 		// Show response time summary
-		min, max, avg, _, _, _ := st.responseTracker.GetStats()
+		min, max, avg:= st.responseTracker.GetStats()
 		fmt.Printf("Response Time Range: %v - %v\n", min, max)
 		fmt.Printf("Average Response Time: %v\n", avg)
 	}
 
 	fmt.Println("Node Stability: PASSED")
-}
-
-// checkDependencies verifies required tools are available
-func checkDependencies() error {
-	// No external dependencies required for RPC-only testing
-	return nil
 }
 
 // loadEnvFile loads environment variables from .env file
@@ -1192,11 +961,6 @@ func main() {
 		}
 	}
 
-	// Check dependencies
-	if err := checkDependencies(); err != nil {
-		log.Fatalf("%v", err)
-	}
-
 	// Load environment variables from .env file
 	if err := loadEnvFile(); err != nil {
 		log.Fatalf("Failed to load .env file: %v", err)
@@ -1238,50 +1002,4 @@ func main() {
 	}
 
 	fmt.Println("Stress testing completed successfully!")
-}
-
-// getGasPrice gets the current gas price from the network
-func (st *StressTest) getGasPrice() (*big.Int, error) {
-	// Check if custom gas price is set
-	if customGasPrice := os.Getenv("GAS_PRICE"); customGasPrice != "" {
-		gasPrice, ok := new(big.Int).SetString(customGasPrice, 10)
-		if ok {
-			fmt.Printf("Using custom gas price: %s wei\n", gasPrice.String())
-			return gasPrice, nil
-		}
-		fmt.Printf("Warning: Invalid custom gas price '%s', falling back to network price\n", customGasPrice)
-	}
-
-	resp, err := st.makeRPCRequest("eth_gasPrice")
-	if err != nil {
-		return nil, err
-	}
-
-	gasPriceHex, ok := resp.Result.(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid gas price response")
-	}
-
-	// Remove "0x" prefix and decode
-	if len(gasPriceHex) < 2 || gasPriceHex[:2] != "0x" {
-		return nil, fmt.Errorf("invalid hex format: %s", gasPriceHex)
-	}
-
-	hexStr := gasPriceHex[2:] // Remove "0x" prefix
-	if len(hexStr)%2 != 0 {
-		hexStr = "0" + hexStr // Pad with leading zero if odd length
-	}
-
-	gasPriceBytes, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode hex gas price: %v", err)
-	}
-
-	gasPrice := new(big.Int).SetBytes(gasPriceBytes)
-
-	// Add 20% buffer to ensure transaction goes through
-	buffer := new(big.Int).Mul(gasPrice, big.NewInt(120))
-	buffer = buffer.Div(buffer, big.NewInt(100))
-
-	return buffer, nil
 }
