@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,22 +96,22 @@ type ResponseTimeTracker struct {
 	transactionsSent       int
 	transactionsMined      int
 	// Enhanced timing tracking
-	blockFinalizationTimes  map[string]time.Time     // Track block finalization time
-	transactionBlocks       map[string]string        // Track which block each transaction was mined in
-	blockFinalizationStatus map[string]bool          // Track finalization status of blocks
+	blockFinalizationTimes  map[string]time.Time // Track block finalization time
+	transactionBlocks       map[string]string    // Track which block each transaction was mined in
+	blockFinalizationStatus map[string]bool      // Track finalization status of blocks
 }
 
 // NewResponseTimeTracker creates a new response time tracker
 func NewResponseTimeTracker() *ResponseTimeTracker {
 	return &ResponseTimeTracker{
-		requestTimes:                      make([]time.Time, 0),
-		responseTimes:                     make([]time.Duration, 0),
-		startTime:                         time.Now(),
-		transactionStartTimes:             make(map[string]time.Time),
-		transactionMiningTimes:            make([]time.Duration, 0),
-		blockFinalizationTimes:            make(map[string]time.Time),
-		transactionBlocks:                 make(map[string]string),
-		blockFinalizationStatus:           make(map[string]bool),
+		requestTimes:            make([]time.Time, 0),
+		responseTimes:           make([]time.Duration, 0),
+		startTime:               time.Now(),
+		transactionStartTimes:   make(map[string]time.Time),
+		transactionMiningTimes:  make([]time.Duration, 0),
+		blockFinalizationTimes:  make(map[string]time.Time),
+		transactionBlocks:       make(map[string]string),
+		blockFinalizationStatus: make(map[string]bool),
 	}
 }
 
@@ -323,8 +324,8 @@ type StressTest struct {
 	responseTracker *ResponseTimeTracker
 	// Add request rate control
 	requestRate int // requests per second (0 = auto-calculate from iterations/duration)
-	// Add private key for transaction signing
-	privateKey *ecdsa.PrivateKey
+	// Add private keys for transaction signing
+	privateKeys []*ecdsa.PrivateKey
 	// Add chain ID for transaction signing
 	chainID *big.Int
 }
@@ -404,7 +405,7 @@ func contains(slice []string, item string) bool {
 }
 
 // NewStressTest creates a new stress test instance
-func NewStressTest(duration, iterations int, nodeURL, testAccount string, requestRate int, privateKey *ecdsa.PrivateKey, chainID *big.Int) *StressTest {
+func NewStressTest(duration, iterations int, nodeURL, testAccount string, requestRate int, privateKeys []*ecdsa.PrivateKey, chainID *big.Int) *StressTest {
 	return &StressTest{
 		duration:        duration,
 		iterations:      iterations,
@@ -413,44 +414,97 @@ func NewStressTest(duration, iterations int, nodeURL, testAccount string, reques
 		client:          &http.Client{Timeout: 30 * time.Second},
 		responseTracker: NewResponseTimeTracker(),
 		requestRate:     requestRate,
-		privateKey:      privateKey,
+		privateKeys:     privateKeys,
 		chainID:         chainID,
 	}
 }
 
-// loadPrivateKey loads private key from environment variable
-func loadPrivateKey() *ecdsa.PrivateKey {
-	privateKeyHex := os.Getenv("PRIVATE_KEY")
-	if privateKeyHex == "" {
-		return nil
+// loadPrivateKeys loads one or more private keys from environment variables
+func loadPrivateKeys() []*ecdsa.PrivateKey {
+	var keys []*ecdsa.PrivateKey
+
+	if rawMulti := os.Getenv("PRIVATE_KEYS"); rawMulti != "" {
+		list, err := parsePrivateKeyList(rawMulti)
+		if err != nil {
+			log.Printf("Warning: Failed to parse PRIVATE_KEYS: %v", err)
+		} else {
+			for idx, keyHex := range list {
+				privateKey, err := parsePrivateKeyHex(keyHex)
+				if err != nil {
+					log.Printf("Warning: PRIVATE_KEYS[%d] invalid: %v", idx, err)
+					continue
+				}
+				keys = append(keys, privateKey)
+			}
+		}
 	}
 
-	// Remove "0x" prefix if present
-	if len(privateKeyHex) >= 2 && privateKeyHex[:2] == "0x" {
-		privateKeyHex = privateKeyHex[2:]
+	// Fallback to single PRIVATE_KEY when no multi-wallet keys parsed
+	if len(keys) == 0 {
+		if single := os.Getenv("PRIVATE_KEY"); single != "" {
+			privateKey, err := parsePrivateKeyHex(single)
+			if err != nil {
+				log.Printf("Warning: PRIVATE_KEY invalid: %v", err)
+			} else {
+				keys = append(keys, privateKey)
+			}
+		}
 	}
 
-	// Validate hex format
-	if len(privateKeyHex) != 64 { // 32 bytes = 64 hex chars
-		log.Printf("Warning: Private key should be 64 hex characters (32 bytes)")
-		return nil
+	return keys
+}
+
+func parsePrivateKeyList(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
 	}
 
-	// Decode hex to bytes
-	privateKeyBytes, err := hex.DecodeString(privateKeyHex)
+	if strings.HasPrefix(raw, "[") {
+		var list []string
+		if err := json.Unmarshal([]byte(raw), &list); err != nil {
+			return nil, err
+		}
+		return list, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	var cleaned []string
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+
+	return cleaned, nil
+}
+
+func parsePrivateKeyHex(privateKeyHex string) (*ecdsa.PrivateKey, error) {
+	value := strings.TrimSpace(privateKeyHex)
+	if value == "" {
+		return nil, fmt.Errorf("empty private key")
+	}
+
+	if strings.HasPrefix(value, "0x") || strings.HasPrefix(value, "0X") {
+		value = value[2:]
+	}
+
+	if len(value) != 64 {
+		return nil, fmt.Errorf("private key should be 64 hex characters (32 bytes)")
+	}
+
+	privateKeyBytes, err := hex.DecodeString(value)
 	if err != nil {
-		log.Printf("Warning: Invalid private key format: %v", err)
-		return nil
+		return nil, fmt.Errorf("invalid private key format: %w", err)
 	}
 
-	// Parse ECDSA private key
 	privateKey, err := crypto.ToECDSA(privateKeyBytes)
 	if err != nil {
-		log.Printf("Warning: Failed to parse private key: %v", err)
-		return nil
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 
-	return privateKey
+	return privateKey, nil
 }
 
 // printHeader prints the test header information
@@ -766,7 +820,7 @@ done:
 // testTransactionTPS tests actual blockchain transaction throughput
 func (st *StressTest) testTransactionTPS() {
 	// Create and run transaction TPS test using the new module
-	tpsTester := NewTransactionTPS(st.nodeURL, st.privateKey, st.iterations, st.responseTracker)
+	tpsTester := NewTransactionTPS(st.nodeURL, st.privateKeys, st.iterations, st.responseTracker)
 	tpsTester.RunTransactionTPSTest()
 }
 
@@ -831,7 +885,7 @@ func (st *StressTest) generateReport() {
 		fmt.Printf("Peak TPS Achieved: %.2f\n", currentTPS)
 
 		// Show response time summary
-		min, max, avg:= st.responseTracker.GetStats()
+		min, max, avg := st.responseTracker.GetStats()
 		fmt.Printf("Response Time Range: %v - %v\n", min, max)
 		fmt.Printf("Average Response Time: %v\n", avg)
 	}
@@ -936,6 +990,7 @@ func showUsage() {
 	fmt.Println("  ITERATIONS           Number of concurrent requests (default: 100)")
 	fmt.Println("  REQUEST_RATE         Requests per second for sustained load (default: auto-calculate)")
 	fmt.Println("  PRIVATE_KEY          Private key for transaction signing (hex format, optional)")
+	fmt.Println("  PRIVATE_KEYS         JSON array or comma-separated private keys (optional)")
 	fmt.Println("  GAS_PRICE            Custom gas price in wei (optional, defaults to network price + 20%)")
 	fmt.Println()
 	fmt.Println("Environment Examples:")
@@ -947,6 +1002,7 @@ func showUsage() {
 	fmt.Println("  export ITERATIONS=200")
 	fmt.Println("  export REQUEST_RATE=50  # Force 50 requests per second")
 	fmt.Println("  export PRIVATE_KEY=0x1234...  # For transaction TPS testing")
+	fmt.Println("  export PRIVATE_KEYS='[\"0x1234...\",\"0xabcd...\"]'  # Multi-wallet support")
 	fmt.Println("  export GAS_PRICE=250000000000  # Custom gas price (250 Gwei)")
 	fmt.Println("  ./stress-test")
 }
@@ -969,14 +1025,14 @@ func main() {
 	// Get configuration from environment variables
 	nodeURL, testAccount, duration, iterations, requestRate := getConfigFromEnv()
 
-	// Load private key from environment variable
-	privateKey := loadPrivateKey()
+	// Load private keys from environment variables
+	privateKeys := loadPrivateKeys()
 
 	// Parse test arguments
 	tests := parseTestArgs()
 
 	// Create and run stress test
-	st := NewStressTest(duration, iterations, nodeURL, testAccount, requestRate, privateKey, nil) // chainID will be set during transaction test
+	st := NewStressTest(duration, iterations, nodeURL, testAccount, requestRate, privateKeys, nil) // chainID will be set during transaction test
 
 	// Set start time
 	st.startTime = time.Now()

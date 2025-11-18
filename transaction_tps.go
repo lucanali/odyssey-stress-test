@@ -22,7 +22,7 @@ import (
 // TransactionTPS handles transaction throughput testing
 type TransactionTPS struct {
 	nodeURL         string
-	privateKey      *ecdsa.PrivateKey
+	privateKeys     []*ecdsa.PrivateKey
 	iterations      int
 	responseTracker *ResponseTimeTracker
 	outputFilePath  string
@@ -31,10 +31,10 @@ type TransactionTPS struct {
 }
 
 // NewTransactionTPS creates a new TransactionTPS instance
-func NewTransactionTPS(nodeURL string, privateKey *ecdsa.PrivateKey, iterations int, responseTracker *ResponseTimeTracker) *TransactionTPS {
+func NewTransactionTPS(nodeURL string, privateKeys []*ecdsa.PrivateKey, iterations int, responseTracker *ResponseTimeTracker) *TransactionTPS {
 	return &TransactionTPS{
 		nodeURL:         nodeURL,
-		privateKey:      privateKey,
+		privateKeys:     privateKeys,
 		iterations:      iterations,
 		responseTracker: responseTracker,
 	}
@@ -44,21 +44,41 @@ func NewTransactionTPS(nodeURL string, privateKey *ecdsa.PrivateKey, iterations 
 func (t *TransactionTPS) RunTransactionTPSTest() {
 	fmt.Println("Testing blockchain transaction TPS...")
 
-	if t.privateKey == nil {
-		fmt.Println("Warning: No private key configured, skipping transaction TPS test")
-		fmt.Println("Set PRIVATE_KEY environment variable to enable transaction testing")
+	if len(t.privateKeys) == 0 {
+		fmt.Println("Warning: No private keys configured, skipping transaction TPS test")
+		fmt.Println("Set PRIVATE_KEY or PRIVATE_KEYS environment variable to enable transaction testing")
 		return
 	}
 
-	fmt.Printf("Sending %d transactions concurrently to measure throughput...\n", t.iterations)
+	walletCount := len(t.privateKeys)
+	assignments := t.distributeIterationsAcrossWallets(walletCount)
+	walletNonces := make([]uint64, walletCount)
+	walletAddresses := make([]string, walletCount)
 
-	// Get current nonce from network
-	nonce, err := t.getCurrentNonce()
-	if err != nil {
-		fmt.Printf("Failed to get current nonce: %v\n", err)
-		return
+	fmt.Printf("Sending %d transactions concurrently to measure throughput using %d wallet(s)...\n", t.iterations, walletCount)
+
+	for i, pk := range t.privateKeys {
+		if assignments[i] == 0 {
+			fmt.Printf("Wallet %d assigned 0 transactions (iterations < wallets)\n", i+1)
+			continue
+		}
+
+		nonce, err := t.getCurrentNonce(pk)
+		if err != nil {
+			fmt.Printf("Failed to get current nonce for wallet %d: %v\n", i+1, err)
+			return
+		}
+		walletNonces[i] = nonce
+
+		addressHex, err := t.addressHexFromPrivateKey(pk)
+		if err != nil {
+			fmt.Printf("Failed to derive address for wallet %d: %v\n", i+1, err)
+			return
+		}
+		walletAddresses[i] = addressHex
+
+		fmt.Printf("Wallet %d (%s) starting with nonce: %d | assigned transactions: %d\n", i+1, addressHex, nonce, assignments[i])
 	}
-	fmt.Printf("Starting with nonce: %d\n", nonce)
 
 	// Record start time
 	startTime := time.Now()
@@ -71,35 +91,46 @@ func (t *TransactionTPS) RunTransactionTPSTest() {
 	var wg sync.WaitGroup
 
 	// Send all transactions at once
-	for i := 0; i < t.iterations; i++ {
-		wg.Add(1)
-		go func(txNonce uint64) {
-			defer wg.Done()
+	for walletIdx, pk := range t.privateKeys {
+		share := assignments[walletIdx]
+		if share == 0 {
+			continue
+		}
+		startNonce := walletNonces[walletIdx]
 
-			// Create and send transaction
-			txHash, err := t.sendRealTransaction(txNonce)
-			if err != nil {
-				// Check if it's a duplicate nonce error
-				if strings.Contains(err.Error(), "already known") {
-					fmt.Printf("Transaction with nonce %d already exists, skipping\n", txNonce)
-				} else {
-					fmt.Printf("Failed to send transaction with nonce %d: %v\n", txNonce, err)
+		for i := 0; i < share; i++ {
+			wg.Add(1)
+			txNonce := startNonce + uint64(i)
+			addressHex := walletAddresses[walletIdx]
+
+			go func(pk *ecdsa.PrivateKey, txNonce uint64, walletLabel string, walletIdx int) {
+				defer wg.Done()
+
+				// Create and send transaction
+				txHash, err := t.sendRealTransaction(pk, txNonce)
+				if err != nil {
+					// Check if it's a duplicate nonce error
+					if strings.Contains(err.Error(), "already known") {
+						fmt.Printf("Wallet %d (%s): transaction with nonce %d already exists, skipping\n", walletIdx+1, walletLabel, txNonce)
+					} else {
+						fmt.Printf("Wallet %d (%s): failed to send transaction with nonce %d: %v\n", walletIdx+1, walletLabel, txNonce, err)
+					}
+					return
 				}
-				return
-			}
 
-			// Record transaction sent
-			t.responseTracker.RecordTransactionSent(txHash)
+				// Record transaction sent
+				t.responseTracker.RecordTransactionSent(txHash)
 
-			fmt.Printf("Transaction %d sent: %s\n", txNonce, txHash)
+				fmt.Printf("Wallet %d (%s) nonce %d sent: %s\n", walletIdx+1, walletLabel, txNonce, txHash)
 
-			// Send transaction hash to channel
-			txChan <- txHash
+				// Send transaction hash to channel
+				txChan <- txHash
 
-			// Start monitoring immediately after sending
-			go t.monitorTransactionInclusion(txHash)
+				// Start monitoring immediately after sending
+				go t.monitorTransactionInclusion(txHash)
 
-		}(nonce + uint64(i))
+			}(pk, txNonce, addressHex, walletIdx)
+		}
 	}
 
 	// Wait for all transactions to be sent
@@ -337,13 +368,58 @@ done:
 	fmt.Println()
 }
 
-// getCurrentNonce gets the current nonce for the test account
-func (t *TransactionTPS) getCurrentNonce() (uint64, error) {
-	// Get the public key from private key
-	publicKey := t.privateKey.Public()
+func (t *TransactionTPS) distributeIterationsAcrossWallets(walletCount int) []int {
+	assignments := make([]int, walletCount)
+	if walletCount == 0 {
+		return assignments
+	}
+
+	base := 0
+	if walletCount > 0 {
+		base = t.iterations / walletCount
+	}
+	remainder := 0
+	if walletCount > 0 {
+		remainder = t.iterations % walletCount
+	}
+
+	for i := 0; i < walletCount; i++ {
+		assignments[i] = base
+		if i < remainder {
+			assignments[i]++
+		}
+	}
+
+	return assignments
+}
+
+func (t *TransactionTPS) addressHexFromPrivateKey(privateKey *ecdsa.PrivateKey) (string, error) {
+	publicKeyECDSA, err := derivePublicKey(privateKey)
+	if err != nil {
+		return "", err
+	}
+	return crypto.PubkeyToAddress(*publicKeyECDSA).Hex(), nil
+}
+
+func derivePublicKey(privateKey *ecdsa.PrivateKey) (*ecdsa.PublicKey, error) {
+	if privateKey == nil {
+		return nil, fmt.Errorf("private key is nil")
+	}
+
+	publicKey := privateKey.Public()
 	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
 	if !ok {
-		return 0, fmt.Errorf("failed to get public key")
+		return nil, fmt.Errorf("failed to get public key")
+	}
+
+	return publicKeyECDSA, nil
+}
+
+// getCurrentNonce gets the current nonce for the test account
+func (t *TransactionTPS) getCurrentNonce(privateKey *ecdsa.PrivateKey) (uint64, error) {
+	publicKeyECDSA, err := derivePublicKey(privateKey)
+	if err != nil {
+		return 0, err
 	}
 
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
@@ -399,12 +475,10 @@ func (t *TransactionTPS) getCurrentNonce() (uint64, error) {
 }
 
 // sendRealTransaction sends a real transaction to the blockchain
-func (t *TransactionTPS) sendRealTransaction(nonce uint64) (string, error) {
-	// Get the public key from private key
-	publicKey := t.privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return "", fmt.Errorf("failed to get public key")
+func (t *TransactionTPS) sendRealTransaction(privateKey *ecdsa.PrivateKey, nonce uint64) (string, error) {
+	publicKeyECDSA, err := derivePublicKey(privateKey)
+	if err != nil {
+		return "", err
 	}
 
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
@@ -431,7 +505,7 @@ func (t *TransactionTPS) sendRealTransaction(nonce uint64) (string, error) {
 		return "", fmt.Errorf("failed to get chain ID: %v", err)
 	}
 	signer := types.NewEIP155Signer(chainID)
-	signedTx, err := types.SignTx(tx, signer, t.privateKey)
+	signedTx, err := types.SignTx(tx, signer, privateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign transaction: %v", err)
 	}
